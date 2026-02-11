@@ -1,0 +1,11 @@
+[project]
+name = "agrobot-infosys"
+version = "0.1.0"
+description = "AI based agriculture assistant"
+requires-python = ">=3.13"
+dependencies = [
+    "flask>=3.1.2",
+    "flask-login>=0.6.3",
+    "flask-sqlalchemy>=3.1.1",
+    "python-dotenv>=1.2.1",
+]
