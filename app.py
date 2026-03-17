@@ -5,30 +5,41 @@ import traceback
 import csv
 import uuid
 import re
+import shutil
+import base64
+import logging
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from functools import wraps
-import shutil
-import base64
 
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, send_from_directory, session, \
-    send_file
+import requests
+from flask import (
+    Flask, render_template, request, redirect, url_for, flash,
+    jsonify, send_from_directory, session, send_file, abort, current_app
+)
 from flask_login import LoginManager, login_user, logout_user, login_required, current_user, UserMixin
 from werkzeug.security import check_password_hash, generate_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import func, desc, text, inspect
 from flask_sqlalchemy import SQLAlchemy
 from dotenv import load_dotenv
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 load_dotenv()
 
-# Create Flask app
+# -------------------------------------------------------------------
+# 1. Create Flask app FIRST
+# -------------------------------------------------------------------
 app = Flask(__name__, static_folder="static", template_folder="templates")
 
-# Configuration
+# -------------------------------------------------------------------
+# 2. Configuration
+# -------------------------------------------------------------------
 app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "super_secret_key_123")
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["SQLALCHEMY_ECHO"] = False  # Set to False to reduce logs
+app.config["SQLALCHEMY_ECHO"] = False
+app.config['WEATHER_API_KEY'] = '65e1bfc3c34734109d78b1bdb4c9d05e'
+app.config['WEATHER_API_URL'] = 'https://api.openweathermap.org/data/2.5'
 
 # Database configuration
 basedir = os.path.abspath(os.path.dirname(__file__))
@@ -40,7 +51,6 @@ if database_url:
     app.config['SQLALCHEMY_DATABASE_URI'] = database_url
     print(f"📁 Using PostgreSQL database")
 else:
-    # Use a FIXED, permanent path for SQLite database
     db_dir = os.path.join(basedir, "data")
     os.makedirs(db_dir, exist_ok=True)
     db_path = os.path.join(db_dir, "agrobot.db")
@@ -50,69 +60,77 @@ else:
 # File upload configuration
 UPLOAD_FOLDER = os.path.join(basedir, "static", "uploads")
 THUMBNAIL_FOLDER = os.path.join(basedir, "static", "thumbnails")
+DOCUMENT_FOLDER = os.path.join(basedir, "uploads", "documents")
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 app.config["THUMBNAIL_FOLDER"] = THUMBNAIL_FOLDER
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
+app.config['UPLOAD_FOLDER_DOCS'] = DOCUMENT_FOLDER
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(THUMBNAIL_FOLDER, exist_ok=True)
+os.makedirs(DOCUMENT_FOLDER, exist_ok=True)
 
 # Allowed extensions
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'}
 ALLOWED_DOC_EXTENSIONS = {'pdf', 'txt', 'doc', 'docx', 'csv'}
 
-# Initialize SQLAlchemy
+# -------------------------------------------------------------------
+# 3. Initialize extensions (db, login_manager)
+# -------------------------------------------------------------------
 db = SQLAlchemy(app)
-
-# Initialize Login Manager
 login_manager = LoginManager()
 login_manager.init_app(app)
 login_manager.login_view = "login"
 
-# Get Gemini API key
+# -------------------------------------------------------------------
+# 4. Initialize SocketIO (app is defined)
+# -------------------------------------------------------------------
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+# -------------------------------------------------------------------
+# 5. Gemini AI setup
+# -------------------------------------------------------------------
 GEMINI_API_KEY = os.getenv('GEMINI_API_KEY')
 GEMINI_ENABLED = False
 gemini_client = None
 
-# Try to import and configure Gemini
 try:
-    # Try new package first
+    from google import genai as google_genai
+
+    if GEMINI_API_KEY and GEMINI_API_KEY != "not_set":
+        gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
+        GEMINI_ENABLED = True
+        print("🔑 Gemini configured (new package)")
+except ImportError:
     try:
-        from google import genai as google_genai
+        import google.generativeai as genai_old
 
         if GEMINI_API_KEY and GEMINI_API_KEY != "not_set":
-            gemini_client = google_genai.Client(api_key=GEMINI_API_KEY)
+            genai_old.configure(api_key=GEMINI_API_KEY)
+            gemini_client = genai_old
             GEMINI_ENABLED = True
-            print(f"🔑 Gemini configured (new package)")
+            print("🔑 Gemini configured (old package)")
     except ImportError:
-        # Try old package
-        try:
-            import google.generativeai as genai_old
-
-            if GEMINI_API_KEY and GEMINI_API_KEY != "not_set":
-                genai_old.configure(api_key=GEMINI_API_KEY)
-                gemini_client = genai_old
-                GEMINI_ENABLED = True
-                print(f"🔑 Gemini configured (old package)")
-        except ImportError:
-            print("⚠️ No Gemini package found")
+        print("⚠️ No Gemini package found")
 except Exception as e:
     print(f"⚠️ Gemini configuration failed: {e}")
-    GEMINI_ENABLED = False
 
 if not GEMINI_API_KEY or GEMINI_API_KEY == "not_set":
     print("⚠️ Warning: GEMINI_API_KEY not found in .env file")
 
 
+# -------------------------------------------------------------------
 # Helper function for UTC timestamps
+# -------------------------------------------------------------------
 def utc_now():
     return datetime.now(timezone.utc)
 
 
-# ==================== DATABASE MODELS ====================
+# -------------------------------------------------------------------
+# DATABASE MODELS
+# -------------------------------------------------------------------
 
 class User(db.Model, UserMixin):
-    """User model for farmers and admins"""
     __tablename__ = 'users'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -135,35 +153,23 @@ class User(db.Model, UserMixin):
     farm_address = db.Column(db.Text)
     experience_level = db.Column(db.String(50), nullable=False, default='beginner')
     preferred_language = db.Column(db.String(10), nullable=False, default='en')
-
-    # Notification preferences
     notify_weather = db.Column(db.Boolean, default=True)
     notify_pests = db.Column(db.Boolean, default=True)
     notify_market = db.Column(db.Boolean, default=True)
     notify_tips = db.Column(db.Boolean, default=True)
-
-    # Interests
     interest_organic = db.Column(db.Boolean, default=False)
     interest_hydroponics = db.Column(db.Boolean, default=False)
     interest_precision = db.Column(db.Boolean, default=False)
     interest_dairy = db.Column(db.Boolean, default=False)
     interest_poultry = db.Column(db.Boolean, default=False)
     interest_fisheries = db.Column(db.Boolean, default=False)
-
-    # Consent
     newsletter = db.Column(db.Boolean, default=True)
     share_data = db.Column(db.Boolean, default=False)
-
-    # Referral
     referral_code = db.Column(db.String(50))
     points_balance = db.Column(db.Integer, default=0)
-
-    # Account status
     is_active = db.Column(db.Boolean, default=True)
     is_verified = db.Column(db.Boolean, default=False)
     role = db.Column(db.String(20), default='farmer')
-
-    # Timestamps - FIXED: Using lambda functions for proper default
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
     updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
                            onupdate=lambda: datetime.now(timezone.utc))
@@ -171,26 +177,25 @@ class User(db.Model, UserMixin):
     email_verified_at = db.Column(db.DateTime)
     phone_verified_at = db.Column(db.DateTime)
 
-    # Relationships
     chats = db.relationship('ChatHistory', backref='user', lazy=True, cascade='all, delete-orphan')
     image_analyses = db.relationship('ImageAnalysis', backref='user', lazy=True, cascade='all, delete-orphan')
     activities = db.relationship('UserActivity', backref='user', lazy=True, cascade='all, delete-orphan')
     points = db.relationship('UserPoints', backref='user', lazy=True, cascade='all, delete-orphan')
+    crop_plans = db.relationship('CropPlan', backref='user', lazy=True, cascade='all, delete-orphan')
+    forum_threads = db.relationship('ForumThread', backref='user', lazy=True)
+    forum_posts = db.relationship('ForumPost', backref='user', lazy=True)
+    documents = db.relationship('Document', backref='user', lazy='dynamic')
 
     def set_password(self, password):
-        """Hash and set password"""
         self.password = generate_password_hash(password)
 
     def check_password(self, password):
-        """Check password hash"""
         return check_password_hash(self.password, password)
 
     def get_id(self):
-        """Required by Flask-Login"""
         return str(self.id)
 
     def to_dict(self):
-        """Convert user to dictionary"""
         return {
             'id': self.id,
             'email': self.email,
@@ -207,7 +212,6 @@ class User(db.Model, UserMixin):
 
 
 class ChatHistory(db.Model):
-    """Chat history model"""
     __tablename__ = 'chat_history'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -221,7 +225,6 @@ class ChatHistory(db.Model):
 
 
 class ImageAnalysis(db.Model):
-    """Image analysis model"""
     __tablename__ = 'image_analyses'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -239,7 +242,6 @@ class ImageAnalysis(db.Model):
 
 
 class FarmingTip(db.Model):
-    """Farming tips model"""
     __tablename__ = 'farming_tips'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -254,7 +256,6 @@ class FarmingTip(db.Model):
 
 
 class MarketPrice(db.Model):
-    """Market prices model"""
     __tablename__ = 'market_prices'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -269,7 +270,6 @@ class MarketPrice(db.Model):
 
 
 class UserActivity(db.Model):
-    """User activity log"""
     __tablename__ = 'user_activities'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -282,7 +282,6 @@ class UserActivity(db.Model):
 
 
 class UserPoints(db.Model):
-    """User points system"""
     __tablename__ = 'user_points'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -295,7 +294,6 @@ class UserPoints(db.Model):
 
 
 class Referral(db.Model):
-    """Referral system"""
     __tablename__ = 'referrals'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -309,7 +307,6 @@ class Referral(db.Model):
 
 
 class WeatherAlert(db.Model):
-    """Weather alerts"""
     __tablename__ = 'weather_alerts'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -324,7 +321,6 @@ class WeatherAlert(db.Model):
 
 
 class OTPVerification(db.Model):
-    """OTP verification"""
     __tablename__ = 'otp_verifications'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -338,10 +334,208 @@ class OTPVerification(db.Model):
     created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-# ==================== HELPER FUNCTIONS ====================
+class CropPlan(db.Model):
+    __tablename__ = 'crop_plans'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    crop_type = db.Column(db.String(100), nullable=False)
+    variety = db.Column(db.String(100))
+    start_date = db.Column(db.Date, nullable=False)
+    expected_harvest = db.Column(db.Date, nullable=False)
+    area = db.Column(db.Float)
+    planting_method = db.Column(db.String(50))
+    notes = db.Column(db.Text)
+    is_active = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc))
+
+    tasks = db.relationship('CropTask', backref='plan', lazy=True, cascade='all, delete-orphan')
+
+
+class CropTask(db.Model):
+    __tablename__ = 'crop_tasks'
+
+    id = db.Column(db.Integer, primary_key=True)
+    plan_id = db.Column(db.Integer, db.ForeignKey('crop_plans.id'), nullable=False)
+    title = db.Column(db.String(200), nullable=False)
+    description = db.Column(db.Text)
+    due_date = db.Column(db.Date, nullable=False)
+    status = db.Column(db.String(20), default='pending')
+    category = db.Column(db.String(50))
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    completed_at = db.Column(db.DateTime)
+
+
+# ==================== FORUM MODELS ====================
+
+class ForumCategory(db.Model):
+    __tablename__ = 'forum_categories'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    description = db.Column(db.String(255))
+    icon = db.Column(db.String(50))
+    color = db.Column(db.String(20))
+    thread_count = db.Column(db.Integer, default=0)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    threads = db.relationship('ForumThread', backref='category', lazy=True)
+
+
+class ForumThread(db.Model):
+    __tablename__ = 'forum_threads'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    category_id = db.Column(db.Integer, db.ForeignKey('forum_categories.id'), nullable=False)
+    views = db.Column(db.Integer, default=0)
+    is_pinned = db.Column(db.Boolean, default=False)
+    is_locked = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc))
+
+    posts = db.relationship('ForumPost', backref='thread', lazy=True, cascade='all, delete-orphan')
+
+
+class ForumPost(db.Model):
+    __tablename__ = 'forum_posts'
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.Text, nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    thread_id = db.Column(db.Integer, db.ForeignKey('forum_threads.id'), nullable=False)
+    is_solution = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    updated_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc),
+                           onupdate=lambda: datetime.now(timezone.utc))
+
+    likes = db.relationship('ForumLike', backref='post', lazy=True, cascade='all, delete-orphan')
+
+
+class ForumLike(db.Model):
+    __tablename__ = 'forum_likes'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    post_id = db.Column(db.Integer, db.ForeignKey('forum_posts.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (db.UniqueConstraint('user_id', 'post_id', name='unique_user_post_like'),)
+
+
+class ForumTag(db.Model):
+    __tablename__ = 'forum_tags'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(50), unique=True, nullable=False)
+
+
+class ForumThreadTag(db.Model):
+    __tablename__ = 'forum_thread_tags'
+    thread_id = db.Column(db.Integer, db.ForeignKey('forum_threads.id'), primary_key=True)
+    tag_id = db.Column(db.Integer, db.ForeignKey('forum_tags.id'), primary_key=True)
+
+
+class UserFollow(db.Model):
+    """User follow relationships (many-to-many self-referential)"""
+    __tablename__ = 'user_follows'
+
+    id = db.Column(db.Integer, primary_key=True)
+    follower_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    followed_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (db.UniqueConstraint('follower_id', 'followed_id', name='unique_follow'),)
+
+    follower = db.relationship('User', foreign_keys=[follower_id], backref='following')
+    followed = db.relationship('User', foreign_keys=[followed_id], backref='followers')
+
+
+class ChatMessage(db.Model):
+    __tablename__ = 'chat_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    room = db.Column(db.String(100), nullable=False)
+    message = db.Column(db.Text, nullable=False)
+    file_url = db.Column(db.String(500))
+    file_type = db.Column(db.String(50))
+    reply_to_id = db.Column(db.Integer, db.ForeignKey('chat_messages.id'), nullable=True)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    sender = db.relationship('User', foreign_keys=[sender_id])
+    replies = db.relationship('ChatMessage', backref=db.backref('reply_to', remote_side=[id]))
+
+
+class MessageReaction(db.Model):
+    """Reactions (emojis) on chat messages"""
+    __tablename__ = 'message_reactions'
+
+    id = db.Column(db.Integer, primary_key=True)
+    message_id = db.Column(db.Integer, db.ForeignKey('chat_messages.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    emoji = db.Column(db.String(10), nullable=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    __table_args__ = (db.UniqueConstraint('message_id', 'user_id', 'emoji', name='unique_reaction'),)
+
+    # This backref creates a `reactions` attribute on ChatMessage
+    message = db.relationship('ChatMessage', backref='reactions')
+    user = db.relationship('User', backref='reactions')
+
+
+class PrivateMessage(db.Model):
+    """Private messages between users"""
+    __tablename__ = 'private_messages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    sender_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    recipient_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+    content = db.Column(db.Text, nullable=False)
+    is_read = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=lambda: datetime.now(timezone.utc))
+
+    sender = db.relationship('User', foreign_keys=[sender_id], backref='sent_messages')
+    recipient = db.relationship('User', foreign_keys=[recipient_id], backref='received_messages')
+
+
+# ==================== DOCUMENT MODEL ====================
+
+class Document(db.Model):
+    __tablename__ = 'documents'
+
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    filename = db.Column(db.String(255), nullable=False)
+    file_type = db.Column(db.String(50))
+    size = db.Column(db.Integer)
+    description = db.Column(db.Text, default='')
+    category = db.Column(db.String(50), default='uploads')
+    uploaded_at = db.Column(db.DateTime, default=db.func.current_timestamp())
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'), nullable=False)
+
+    def formatted_size(self):
+        size = self.size
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if size < 1024.0:
+                return f"{size:.1f} {unit}"
+            size /= 1024.0
+        return f"{size:.1f} TB"
+
+    @property
+    def path(self):
+        return os.path.join(current_app.config['UPLOAD_FOLDER_DOCS'], self.filename)
+
+    @property
+    def url(self):
+        return f'/uploads/documents/{self.filename}'
+
+    # -------------------------------------------------------------------
+
+
+# HELPER FUNCTIONS
+# -------------------------------------------------------------------
 
 def clean_phone_number(phone):
-    """Clean phone number by removing non-digits"""
     if not phone:
         return None
     digits = re.sub(r'\D', '', phone)
@@ -355,12 +549,10 @@ def allowed_file(filename, extensions):
 
 
 def generate_thumbnail(image_path, thumb_path, size=(200, 200)):
-    """Generate thumbnail for image"""
     try:
         from PIL import Image
         with Image.open(image_path) as img:
             img.thumbnail(size)
-            # Convert to RGB if necessary
             if img.mode in ('RGBA', 'LA', 'P'):
                 img = img.convert('RGB')
             img.save(thumb_path, "JPEG")
@@ -400,105 +592,71 @@ LOCAL_KNOWLEDGE = {
 
 
 def get_local_response(user_input, user_profile):
-    """Get response from local knowledge base"""
     try:
         user_input_lower = user_input.lower()
-
         for topic, details in LOCAL_KNOWLEDGE.items():
             if topic in user_input_lower:
                 for subtopic, response in details.items():
                     if subtopic in user_input_lower:
                         return f"**{topic.capitalize()} {subtopic.capitalize()}:**\n{response}\n\n*Source: Local Agricultural Knowledge Base*"
-
                 first_key = next(iter(details))
                 return f"**{topic.capitalize()} Information:**\n{details[first_key]}\n\nFor more specific advice, please ask about planting, fertilizer, water, or harvest."
-
-                # Common questions
         if any(word in user_input_lower for word in ["hello", "hi", "hey"]):
             return "Hello! I'm AgroBot, your agricultural assistant. How can I help you with farming today?"
-
         if any(word in user_input_lower for word in ["help", "what can you do"]):
             return "I can help with:\n• Crop cultivation advice\n• Pest and disease identification\n• Soil and fertilizer recommendations\n• Irrigation guidance\n• Market price information\n• Weather impacts\n• Harvesting techniques\n\nJust ask me anything about farming!"
-
         return None
-
     except Exception as e:
         print(f"Error in get_local_response: {e}")
         return None
 
 
 def get_enhanced_fallback_response(user_input, user_profile):
-    """Get enhanced fallback response"""
     fallback_responses = [
         f"I understand you're asking about '{user_input}'. While I don't have specific information on this, I recommend:\n1. Consulting local agricultural extension officers\n2. Visiting your nearest Krishi Vigyan Kendra\n3. Checking with experienced farmers in your area",
         f"Regarding '{user_input}', this is a specialized topic. For accurate advice, please:\n• Contact your state agriculture department\n• Use the Kisan Call Center (Dial 1551)\n• Download the Kisan Suvidha mobile app",
         f"Thank you for your question about '{user_input}'. For detailed guidance, I suggest:\n1. Soil testing for precise fertilizer recommendations\n2. Weather-based crop planning\n3. Integrated Pest Management (IPM) practices"
     ]
-
     if user_profile.get('region'):
         region = user_profile['region']
         personalized = f"\n\nSince you're in {region}, consider contacting the {region} Agricultural University for region-specific advice."
         return fallback_responses[0] + personalized
-
     return fallback_responses[len(user_input) % len(fallback_responses)]
 
 
 def analyze_with_gemini(image_path, user_message=""):
-    """Analyze image with Gemini Vision with fallback"""
     if not GEMINI_ENABLED or not gemini_client:
         return fallback_image_analysis(image_path)
 
     try:
-        # Read image as base64
         with open(image_path, "rb") as f:
             image_bytes = f.read()
-
         image_b64 = base64.b64encode(image_bytes).decode('utf-8')
 
-        # Determine MIME type
-        if image_path.lower().endswith('.png'):
+        ext = image_path.lower()
+        if ext.endswith('.png'):
             mime_type = 'image/png'
-        elif image_path.lower().endswith('.jpg') or image_path.lower().endswith('.jpeg'):
+        elif ext.endswith('.jpg') or ext.endswith('.jpeg'):
             mime_type = 'image/jpeg'
-        elif image_path.lower().endswith('.gif'):
+        elif ext.endswith('.gif'):
             mime_type = 'image/gif'
-        elif image_path.lower().endswith('.bmp'):
+        elif ext.endswith('.bmp'):
             mime_type = 'image/bmp'
-        elif image_path.lower().endswith('.webp'):
+        elif ext.endswith('.webp'):
             mime_type = 'image/webp'
         else:
             mime_type = 'image/jpeg'
 
-            # Create prompt
-        if user_message:
-            prompt = f"Analyze this agricultural image. User query: {user_message}\n\nProvide:\n1. Plant/crop identification\n2. Health assessment\n3. Pest/disease detection if any\n4. Recommendations"
-        else:
-            prompt = "Analyze this agricultural image. Provide:\n1. Plant/crop identification\n2. Health assessment\n3. Pest/disease detection if any\n4. Recommendations"
+        prompt = f"Analyze this agricultural image. User query: {user_message}\n\nProvide:\n1. Plant/crop identification\n2. Health assessment\n3. Pest/disease detection if any\n4. Recommendations" if user_message else \
+            "Analyze this agricultural image. Provide:\n1. Plant/crop identification\n2. Health assessment\n3. Pest/disease detection if any\n4. Recommendations"
 
-            # Create content parts
-        parts = [
-            {"text": prompt},
-            {
-                "inline_data": {
-                    "mime_type": mime_type,
-                    "data": image_b64
-                }
-            }
-        ]
+        parts = [{"text": prompt}, {"inline_data": {"mime_type": mime_type, "data": image_b64}}]
 
-        # CORRECT VISION MODEL NAMES for new package
-        models_to_try = [
-            'gemini-2.5-flash'  # Basic vision model
-        ]
-
+        models_to_try = ['gemini-2.5-flash', 'gemini-1.5-flash', 'gemini-1.5-pro']
         for model_name in models_to_try:
             try:
                 print(f"  🤖 Trying vision model: {model_name}")
-                response = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents=parts
-                )
-
+                response = gemini_client.models.generate_content(model=model_name, contents=parts)
                 if response and response.text:
                     print(f"  ✅ Vision analysis successful with model: {model_name}")
                     return {
@@ -510,26 +668,20 @@ def analyze_with_gemini(image_path, user_message=""):
                     }
             except Exception as e:
                 error_msg = str(e)
-                print(f"  ✗ Vision model {model_name} error: {error_msg[:100]}")
-
-                # If rate limited, use fallback immediately
+                print(f"  ✗ Vision model {model_name} error: {error_msg[:200]}")
                 if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
                     print("  ⚠️ Rate limited, using fallback analysis")
                     return fallback_image_analysis(image_path)
                 if "404" in error_msg or "NOT_FOUND" in error_msg:
-                    print(f"  ⚠️ Model {model_name} not found, trying next...")
                     continue
                 continue
-
     except Exception as e:
         print(f"Gemini Vision error: {e}")
 
-        # Fallback if all Gemini attempts fail
     return fallback_image_analysis(image_path)
 
 
 def fallback_image_analysis(image_path):
-    """Fallback analysis when Gemini fails"""
     try:
         from PIL import Image
         im = Image.open(image_path).convert('RGB').resize((200, 200))
@@ -558,16 +710,33 @@ def fallback_image_analysis(image_path):
                 "Look for signs of pests on underside of leaves"
             ]
         }
-    except Exception as img_error:
+    except ImportError:
+        print("⚠️ PIL/Pillow not installed. Install it with: pip install Pillow")
         return {
-            "health_status": "Analysis failed",
-            "analysis": "Unable to analyze image. Please try with a clearer photo.",
-            "recommendations": ["Ensure good lighting", "Take photo against plain background"]
+            "health_status": "Image received",
+            "analysis": "Your image was uploaded successfully. For detailed AI plant analysis, the Gemini API is required. Please check the server logs to see the error.",
+            "recommendations": [
+                "Ensure Pillow is installed: pip install Pillow",
+                "Check server console for Gemini API error details",
+                "Verify your GEMINI_API_KEY is valid"
+            ]
+        }
+    except Exception as img_error:
+        print(f"❌ fallback_image_analysis error: {img_error}")
+        print(f"   Image path was: {image_path}")
+        print(f"   File exists: {os.path.exists(image_path)}")
+        return {
+            "health_status": "Image received",
+            "analysis": f"Image uploaded successfully but local analysis failed. Check server logs for details.",
+            "recommendations": [
+                "Check server console for error details",
+                "Ensure the image file is a valid JPEG/PNG",
+                "Try uploading a different image"
+            ]
         }
 
 
 def ask_gemini(user_input, user_profile=None):
-    """Ask Gemini AI for response with fallback"""
     if not GEMINI_ENABLED or not gemini_client:
         return get_enhanced_fallback_response(user_input, user_profile)
 
@@ -599,47 +768,84 @@ def ask_gemini(user_input, user_profile=None):
     Provide comprehensive agricultural advice:"""
 
     try:
-        # Try with the new package structure
         if hasattr(gemini_client, 'models'):
-            # CORRECT MODEL NAMES for new package
-            models_to_try = [
-                'gemini-2.5-flash'  # Basic model
-            ]
-
+            models_to_try = ['gemini-2.5-flash']
             for model_name in models_to_try:
                 try:
                     print(f"  🤖 Trying model: {model_name}")
-                    response = gemini_client.models.generate_content(
-                        model=model_name,
-                        contents=prompt
-                    )
-
+                    response = gemini_client.models.generate_content(model=model_name, contents=prompt)
                     if response and response.text:
                         print(f"  ✅ Success with model: {model_name}")
                         return response.text
                 except Exception as e:
                     error_msg = str(e)
                     print(f"  ✗ Model {model_name} error: {error_msg[:100]}")
-
-                    # Check for specific errors
                     if "429" in error_msg or "RESOURCE_EXHAUSTED" in error_msg:
                         print("  ⚠️ Rate limited, using fallback")
                         return get_enhanced_fallback_response(user_input, user_profile)
                     if "404" in error_msg or "NOT_FOUND" in error_msg:
-                        print(f"  ⚠️ Model {model_name} not found, trying next...")
                         continue
                     continue
-
-                    # Fallback if all attempts fail
         return get_enhanced_fallback_response(user_input, user_profile)
-
     except Exception as e:
         print(f"Gemini API error: {e}")
         return get_enhanced_fallback_response(user_input, user_profile)
 
-    # ==================== ADMIN DECORATOR ====================
+
+def generate_default_tasks(plan):
+    default_tasks = [
+        {
+            'title': 'Land Preparation',
+            'description': 'Plowing, leveling, and adding manure',
+            'due_date': plan.start_date - timedelta(days=7),
+            'category': 'preparation'
+        },
+        {
+            'title': 'Planting/Sowing',
+            'description': f'Sow {plan.crop_type} seeds',
+            'due_date': plan.start_date,
+            'category': 'planting'
+        },
+        {
+            'title': 'First Fertilizer Application',
+            'description': 'Apply NPK fertilizer as per soil test',
+            'due_date': plan.start_date + timedelta(days=30),
+            'category': 'fertilizing'
+        },
+        {
+            'title': 'Irrigation Check',
+            'description': 'Ensure proper irrigation system',
+            'due_date': plan.start_date + timedelta(days=15),
+            'category': 'irrigation'
+        },
+        {
+            'title': 'Pest Scouting',
+            'description': 'Inspect for early signs of pests',
+            'due_date': plan.start_date + timedelta(days=45),
+            'category': 'pest_control'
+        },
+        {
+            'title': 'Harvest',
+            'description': 'Harvest mature crops',
+            'due_date': plan.expected_harvest,
+            'category': 'harvest'
+        }
+    ]
+    for task_data in default_tasks:
+        task = CropTask(
+            plan_id=plan.id,
+            title=task_data['title'],
+            description=task_data['description'],
+            due_date=task_data['due_date'],
+            category=task_data['category']
+        )
+        db.session.add(task)
+    db.session.commit()
 
 
+# -------------------------------------------------------------------
+# ADMIN DECORATOR
+# -------------------------------------------------------------------
 def admin_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
@@ -654,13 +860,11 @@ def admin_required(f):
     return decorated_function
 
 
-import json
-
-
-# Add this after creating your Flask app
+# -------------------------------------------------------------------
+# Custom Jinja filters
+# -------------------------------------------------------------------
 @app.template_filter('fromjson')
 def fromjson_filter(value):
-    """Convert JSON string to Python object"""
     if not value or value == '[]':
         return []
     try:
@@ -669,28 +873,50 @@ def fromjson_filter(value):
         return []
 
 
+@app.template_filter('timeago')
+def timeago_filter(date):
+    """Convert a datetime to a human-readable 'time ago' string."""
+    if not date:
+        return ''
+    if date.tzinfo is None:
+        date = date.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    diff = now - date
+    if diff.days > 365:
+        return f"{diff.days // 365} years ago"
+    if diff.days > 30:
+        return f"{diff.days // 30} months ago"
+    if diff.days > 0:
+        return f"{diff.days} days ago"
+    if diff.seconds > 3600:
+        return f"{diff.seconds // 3600} hours ago"
+    if diff.seconds > 60:
+        return f"{diff.seconds // 60} minutes ago"
+    return "just now"
+
+
+@app.template_filter('nl2br')
+def nl2br_filter(s):
+    if not s:
+        return ''
+    return s.replace('\n', '<br>\n')
+
+
+# -------------------------------------------------------------------
+# API and debug routes
+# -------------------------------------------------------------------
+
 @app.route('/api/list-gemini-models')
 @login_required
 def list_gemini_models():
-    """List available Gemini models"""
     try:
         if not GEMINI_ENABLED or not gemini_client:
             return jsonify({"success": False, "message": "Gemini not enabled"})
-
         available_models = []
-
-        # Test a few common models to see which ones work
-        test_models = [
-            'gemini-2.5-flash'
-        ]
-
+        test_models = ["gemini-2.5-flash","gemini-1.5-pro"]
         for model_name in test_models:
             try:
-                # Quick test to see if model exists
-                response = gemini_client.models.generate_content(
-                    model=model_name,
-                    contents="Say 'test'"
-                )
+                response = gemini_client.models.generate_content(model=model_name, contents="Say 'test'")
                 available_models.append({
                     "name": model_name,
                     "status": "available",
@@ -706,31 +932,23 @@ def list_gemini_models():
                     status = "auth_error"
                 else:
                     status = "error"
-
                 available_models.append({
                     "name": model_name,
                     "status": status,
                     "error": error_msg[:100]
                 })
-
         return jsonify({
             "success": True,
             "models": available_models,
             "total_tested": len(test_models),
             "available_count": len([m for m in available_models if m["status"] == "available"])
         })
-
     except Exception as e:
-        return jsonify({
-            "success": False,
-            "error": str(e),
-            "message": "Failed to list models"
-        })
+        return jsonify({"success": False, "error": str(e), "message": "Failed to list models"})
 
 
 @app.route('/test-gemini')
 def test_gemini():
-    """Diagnostic route to test Gemini connectivity"""
     try:
         if not GEMINI_ENABLED or not gemini_client:
             return jsonify({
@@ -739,14 +957,11 @@ def test_gemini():
                 "gemini_enabled": GEMINI_ENABLED,
                 "api_key_configured": bool(GEMINI_API_KEY and GEMINI_API_KEY != "not_set")
             })
-
-            # Test with a simple query
         try:
             response = gemini_client.models.generate_content(
                 model='gemini-1.5-pro',
                 contents="Say 'Hello AgroBot' in one word."
             )
-
             return jsonify({
                 "status": "connected",
                 "package": "new (google.genai)",
@@ -762,22 +977,26 @@ def test_gemini():
                 "error": error_msg[:200],
                 "suggestion": "Try using gemini-1.0-pro or check your API quota"
             })
-
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Failed to check API status: {str(e)[:100]}"
-        })
-
-    # ==================== LOGIN MANAGER ====================
+        return jsonify({"status": "error", "message": f"Failed to check API status: {str(e)[:100]}"})
 
 
+@app.route('/test-key')
+def test_key():
+    return f"API Key is: {app.config.get('WEATHER_API_KEY', 'NOT FOUND')}"
+
+
+# -------------------------------------------------------------------
+# LOGIN MANAGER
+# -------------------------------------------------------------------
 @login_manager.user_loader
 def load_user(user_id):
     return db.session.get(User, int(user_id))
 
 
-# ==================== ROUTES ====================
+# -------------------------------------------------------------------
+# PUBLIC ROUTES
+# -------------------------------------------------------------------
 
 @app.route('/')
 @app.route('/home')
@@ -805,107 +1024,29 @@ def contact():
     return render_template('contact.html')
 
 
-@app.route('/chat')
-@login_required
-def chat():
-    recent_users = None
-    if current_user.role == 'admin':
-        recent_users = User.query.order_by(User.id.desc()).limit(20).all()
-
-    recent_chats = ChatHistory.query.filter_by(
-        user_id=current_user.id
-    ).order_by(ChatHistory.created_at.desc()).limit(20).all()
-
-    return render_template('chat.html', recent_users=recent_users, recent_chats=recent_chats)
-
-
-@app.route('/dashboard')
-@login_required
-def dashboard():
-    total_chats = ChatHistory.query.filter_by(user_id=current_user.id).count()
-    recent_chats = ChatHistory.query.filter_by(
-        user_id=current_user.id
-    ).order_by(ChatHistory.created_at.desc()).limit(5).all()
-
-    image_analyses = ImageAnalysis.query.filter_by(
-        user_id=current_user.id
-    ).order_by(ImageAnalysis.created_at.desc()).limit(5).all()
-
-    return render_template('dashboard.html',
-                           total_chats=total_chats,
-                           recent_chats=recent_chats,
-                           image_analyses=image_analyses)
-
-
-@app.route('/weather')
-@login_required
-def weather():
-    return render_template('weather.html')
-
-
-@app.route('/market')
-@login_required
-def market_prices():
-    return render_template('market.html')
-
-
-@app.route('/crop-planner')
-@login_required
-def crop_planner():
-    return render_template('crop_planner.html')
-
-
-@app.route('/pest-database')
-@login_required
-def pest_database():
-    return render_template('pest_database.html')
-
-
-@app.route('/community')
-@login_required
-def community_forum():
-    return render_template('community.html')
-
-
-@app.route('/docs')
-@login_required
-def document_center():
-    return render_template('docs.html')
-
-
-@app.route('/notifications')
-@login_required
-def notifications():
-    return render_template('notifications.html')
-
-
-# ==================== AUTH ROUTES ====================
+# -------------------------------------------------------------------
+# AUTHENTICATION ROUTES
+# -------------------------------------------------------------------
 
 @app.route('/register', methods=['GET', 'POST'])
 def register():
     if current_user.is_authenticated:
         return redirect(url_for('dashboard'))
-
     if request.method == 'GET':
         return render_template('register.html')
-
     if request.method == 'POST':
         try:
-            # Get form data
             email = request.form.get('email', '').strip().lower()
             name = request.form.get('name', '').strip()
             raw_phone = request.form.get('phone', '').strip()
             password = request.form.get('password', '').strip()
             confirm_password = request.form.get('confirm_password', '').strip()
-
-            # Clean phone number
             phone = re.sub(r'\D', '', raw_phone)
             if len(phone) >= 10:
                 phone = f"+{phone}" if not phone.startswith('+') else phone
             else:
                 phone = None
 
-                # Validation
             errors = []
             if not email or '@' not in email:
                 errors.append('Valid email is required')
@@ -925,20 +1066,14 @@ def register():
                     flash(error, 'danger')
                 return render_template('register.html', form_data=request.form.to_dict())
 
-                # Check for existing user
-            existing_user = User.query.filter(
-                db.func.lower(User.email) == email
-            ).first()
-
+            existing_user = User.query.filter(db.func.lower(User.email) == email).first()
             if existing_user:
                 flash('Email already registered. Please login instead.', 'danger')
                 return render_template('register.html', form_data=request.form.to_dict())
-
             if phone and User.query.filter_by(phone=phone).first():
                 flash('Phone number already registered.', 'danger')
                 return render_template('register.html', form_data=request.form.to_dict())
 
-                # Create new user with minimal required fields first
             user = User(
                 email=email,
                 name=name,
@@ -949,39 +1084,30 @@ def register():
                 experience_level=request.form.get('experience_level', 'beginner'),
                 role='farmer',
                 is_active=True,
-                points_balance=100  # Starting points
+                points_balance=100
             )
-
-            # Set password
             user.set_password(password)
 
-            # Add optional fields if provided
             optional_fields = [
                 'whatsapp', 'gender', 'farm_name', 'secondary_crops',
                 'soil_type', 'irrigation_type', 'district', 'farm_address',
                 'preferred_language', 'referral_code'
             ]
-
             for field in optional_fields:
                 value = request.form.get(field)
                 if value:
                     setattr(user, field, value.strip())
 
-                    # Handle date of birth
             dob_str = request.form.get('dob')
             if dob_str:
                 try:
                     user.dob = datetime.strptime(dob_str, '%Y-%m-%d').date()
                 except ValueError:
-                    print(f"Warning: Invalid date format: {dob_str}")
+                    pass
 
-                    # Add to database and commit to get user.id
             db.session.add(user)
-            db.session.commit()  # This generates the user.id
+            db.session.commit()
 
-            print(f"✅ User registered successfully: {email}, ID: {user.id}")
-
-            # Now create registration activity with valid user.id
             activity = UserActivity(
                 user_id=user.id,
                 activity_type='registration',
@@ -992,7 +1118,6 @@ def register():
             db.session.add(activity)
             db.session.commit()
 
-            # Login the user
             login_user(user, remember=True)
             session['user_id'] = user.id
             session['user_name'] = user.name
@@ -1002,7 +1127,6 @@ def register():
 
             flash(f'Registration successful! Welcome to AI-AgroBot, {user.name}!', 'success')
             return redirect(url_for('dashboard'))
-
         except Exception as e:
             db.session.rollback()
             print(f"❌ Registration error: {str(e)}")
@@ -1015,44 +1139,28 @@ def register():
 def login():
     if current_user.is_authenticated:
         return redirect(url_for("dashboard"))
-
     if request.method == "GET":
         return render_template('login.html')
-
     if request.method == "POST":
         try:
             email = request.form.get("email", "").strip().lower()
             password = request.form.get("password", "")
-
             if not email or not password:
                 flash("Please enter both email and password", "danger")
                 return render_template('login.html', form_data={'email': email})
-
-                # Find user by email (case-insensitive)
             user = User.query.filter(db.func.lower(User.email) == email).first()
-
             if user:
-                # Check if user is active
                 if not user.is_active:
                     flash("Your account is not active. Please contact support.", "danger")
                     return render_template('login.html', form_data={'email': email})
-
-                    # Check password
                 if user.check_password(password):
-                    # Login the user
                     login_user(user, remember=True)
-
-                    # Update last login
                     user.last_login = datetime.now(timezone.utc)
-
-                    # Set session variables
                     session['user_id'] = user.id
                     session['user_name'] = user.name
                     session['user_email'] = user.email
                     session['user_role'] = user.role
                     session['logged_in'] = True
-
-                    # Log the activity
                     activity = UserActivity(
                         user_id=user.id,
                         activity_type='login',
@@ -1062,10 +1170,7 @@ def login():
                     )
                     db.session.add(activity)
                     db.session.commit()
-
                     flash(f"Welcome back, {user.name}!", "success")
-
-                    # Redirect based on role
                     next_page = request.args.get('next')
                     if next_page:
                         return redirect(next_page)
@@ -1074,15 +1179,11 @@ def login():
                     flash("Invalid email or password", "danger")
             else:
                 flash(f"No account found with email: {email}. Please register first.", "warning")
-                return render_template('login.html',
-                                       form_data={'email': email},
-                                       suggest_register=True)
-
+                return render_template('login.html', form_data={'email': email}, suggest_register=True)
         except Exception as e:
             print(f"🔥 Login error: {str(e)}")
             traceback.print_exc()
             flash(f"Login error: {str(e)}", "danger")
-
     return render_template('login.html', form_data={'email': email if 'email' in locals() else ''})
 
 
@@ -1091,7 +1192,6 @@ def login():
 def logout():
     try:
         if current_user.is_authenticated:
-            # Log the activity
             activity = UserActivity(
                 user_id=current_user.id,
                 activity_type='logout',
@@ -1101,21 +1201,14 @@ def logout():
             )
             db.session.add(activity)
             db.session.commit()
-
-            # Clear all session data
             session.clear()
-
-            # Logout the user
             logout_user()
-
             flash("You have been logged out successfully!", "info")
-
     except Exception as e:
         print(f"Logout error: {e}")
         session.clear()
         logout_user()
         flash("Logged out successfully", "info")
-
     return redirect(url_for("home"))
 
 
@@ -1124,7 +1217,6 @@ def logout():
 def profile():
     total_chats = ChatHistory.query.filter_by(user_id=current_user.id).count()
     total_images = ImageAnalysis.query.filter_by(user_id=current_user.id).count()
-
     if request.method == "POST":
         try:
             current_user.name = request.form.get("name", "")
@@ -1133,7 +1225,6 @@ def profile():
             current_user.farm_size = request.form.get("farm_size", "")
             current_user.experience_level = request.form.get("experience_level", "beginner")
             current_user.preferred_language = request.form.get("preferred_language", "en")
-
             if 'profile_picture' in request.files:
                 file = request.files['profile_picture']
                 if file and file.filename != '' and allowed_file(file.filename, ALLOWED_EXTENSIONS):
@@ -1142,20 +1233,45 @@ def profile():
                     filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
                     file.save(filepath)
                     current_user.profile_picture = filename
-
             db.session.commit()
             flash("Profile updated successfully!", "success")
-
         except Exception as e:
             db.session.rollback()
             flash(f"Update failed: {str(e)}", "danger")
+    return render_template("profile.html", total_chats=total_chats, total_images=total_images)
 
-    return render_template("profile.html",
+
+# -------------------------------------------------------------------
+# CHAT & AI ROUTES
+# -------------------------------------------------------------------
+
+@app.route('/chat')
+@login_required
+def chat():
+    recent_users = None
+    if current_user.role == 'admin':
+        recent_users = User.query.order_by(User.id.desc()).limit(20).all()
+    recent_chats = ChatHistory.query.filter_by(
+        user_id=current_user.id
+    ).order_by(ChatHistory.created_at.desc()).limit(20).all()
+    return render_template('chat.html', recent_users=recent_users, recent_chats=recent_chats)
+
+
+@app.route('/dashboard')
+@login_required
+def dashboard():
+    total_chats = ChatHistory.query.filter_by(user_id=current_user.id).count()
+    recent_chats = ChatHistory.query.filter_by(
+        user_id=current_user.id
+    ).order_by(ChatHistory.created_at.desc()).limit(5).all()
+    image_analyses = ImageAnalysis.query.filter_by(
+        user_id=current_user.id
+    ).order_by(ImageAnalysis.created_at.desc()).limit(5).all()
+    return render_template('dashboard.html',
                            total_chats=total_chats,
-                           total_images=total_images)
+                           recent_chats=recent_chats,
+                           image_analyses=image_analyses)
 
-
-# ==================== CHAT & AI ROUTES ====================
 
 @app.route("/api/chat", methods=["POST"])
 @login_required
@@ -1163,10 +1279,8 @@ def api_chat():
     try:
         data = request.get_json() or {}
         message = (data.get("message") or "").strip()
-
         if not message:
             return jsonify({"success": False, "response": "Please type a question."})
-
         user_profile = {
             "id": current_user.id,
             "name": current_user.name,
@@ -1176,12 +1290,8 @@ def api_chat():
             "experience_level": current_user.experience_level,
             "preferred_language": current_user.preferred_language
         }
-
-        # STEP 1: Try local knowledge base first
         reply = get_local_response(message, user_profile)
-
         if not reply:
-            # STEP 2: Try Gemini for complex queries
             if GEMINI_ENABLED:
                 try:
                     gemini_reply = ask_gemini(message, user_profile)
@@ -1189,12 +1299,8 @@ def api_chat():
                         reply = gemini_reply
                 except Exception as e:
                     print(f"   ❌ Gemini error: {e}")
-
-                    # STEP 3: Final fallback
         if not reply or reply.strip() == "":
             reply = get_enhanced_fallback_response(message, user_profile)
-
-            # Store in chat history
         chat_entry = ChatHistory(
             user_id=current_user.id,
             user_message=message,
@@ -1204,7 +1310,6 @@ def api_chat():
         )
         db.session.add(chat_entry)
         db.session.commit()
-
         return jsonify({
             "success": True,
             "response": reply,
@@ -1213,7 +1318,6 @@ def api_chat():
             "source": "local_kb" if "local_kb" in str(
                 locals()) else "gemini" if "gemini_reply" in locals() else "fallback"
         })
-
     except Exception as e:
         print(f"Chat API error: {e}")
         traceback.print_exc()
@@ -1235,10 +1339,7 @@ def gemini_status():
             "message": "Gemini API is working" if GEMINI_ENABLED else "Gemini is disabled or not configured"
         })
     except Exception as e:
-        return jsonify({
-            "status": "error",
-            "message": f"Failed to check API status: {str(e)[:100]}"
-        })
+        return jsonify({"status": "error", "message": f"Failed to check API status: {str(e)[:100]}"})
 
 
 @app.route("/api/chat/history", methods=["GET"])
@@ -1247,23 +1348,18 @@ def chat_history():
     try:
         limit = request.args.get('limit', 50, type=int)
         page = request.args.get('page', 1, type=int)
-
         chats = ChatHistory.query.filter_by(
             user_id=current_user.id
         ).order_by(ChatHistory.created_at.desc()).paginate(
             page=page, per_page=limit, error_out=False
         )
-
-        history = []
-        for chat in chats.items:
-            history.append({
-                "id": chat.id,
-                "user_message": chat.user_message,
-                "bot_response": chat.bot_response,
-                "timestamp": chat.created_at.isoformat() if chat.created_at else None,
-                "type": chat.chat_type
-            })
-
+        history = [{
+            "id": chat.id,
+            "user_message": chat.user_message,
+            "bot_response": chat.bot_response,
+            "timestamp": chat.created_at.isoformat() if chat.created_at else None,
+            "type": chat.chat_type
+        } for chat in chats.items]
         return jsonify({
             "success": True,
             "history": history,
@@ -1271,7 +1367,6 @@ def chat_history():
             "pages": chats.pages,
             "current_page": chats.page
         })
-
     except Exception as e:
         print(f"History error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
@@ -1288,39 +1383,30 @@ def clear_chat_history():
         db.session.rollback()
         return jsonify({"success": False, "error": str(e)}), 500
 
-    # ==================== IMAGE ANALYSIS ====================
+    # -------------------------------------------------------------------
 
+
+# IMAGE ANALYSIS
+# -------------------------------------------------------------------
 
 @app.route("/api/analyze-image", methods=["POST"])
 @login_required
 def analyze_image():
     try:
         if 'image' not in request.files:
-            return jsonify({
-                "success": False,
-                "error": "No image file provided"
-            }), 400
-
+            return jsonify({"success": False, "error": "No image file provided"}), 400
         file = request.files['image']
         text_message = request.form.get('message', '').strip()
-
         if file.filename == '':
-            return jsonify({
-                "success": False,
-                "error": "No file selected"
-            }), 400
-
+            return jsonify({"success": False, "error": "No file selected"}), 400
         if not allowed_file(file.filename, ALLOWED_EXTENSIONS):
-            return jsonify({
-                "success": False,
-                "error": f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"
-            }), 400
+            return jsonify(
+                {"success": False, "error": f"Invalid file type. Allowed: {', '.join(ALLOWED_EXTENSIONS)}"}), 400
 
         file_ext = file.filename.rsplit('.', 1)[1].lower()
         unique_id = str(uuid.uuid4())[:8]
         filename = f"{current_user.id}_{unique_id}_{int(time.time())}.{file_ext}"
         filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
         file.save(filepath)
 
         thumb_filename = f"thumb_{filename}"
@@ -1357,15 +1443,10 @@ def analyze_image():
             "thumbnail_url": url_for('uploaded_thumbnail', filename=thumb_filename, _external=True),
             "analysis_id": image_analysis.id
         })
-
     except Exception as e:
         print(f"Image analysis error: {e}")
         traceback.print_exc()
-        return jsonify({
-            "success": False,
-            "error": "Image analysis failed",
-            "message": str(e)
-        }), 500
+        return jsonify({"success": False, "error": "Image analysis failed", "message": str(e)}), 500
 
 
 @app.route("/api/image-analyses", methods=["GET"])
@@ -1376,25 +1457,18 @@ def get_image_analyses():
         analyses = ImageAnalysis.query.filter_by(
             user_id=current_user.id
         ).order_by(ImageAnalysis.created_at.desc()).limit(limit).all()
-
-        result = []
-        for analysis in analyses:
-            result.append({
-                "id": analysis.id,
-                "filename": analysis.filename,
-                "thumbnail": analysis.thumbnail,
-                "user_message": analysis.user_message,
-                "health_status": analysis.health_status,
-                "created_at": analysis.created_at.isoformat() if analysis.created_at else None,
-                "confidence": analysis.confidence_score
-            })
-
+        result = [{
+            "id": a.id,
+            "filename": a.filename,
+            "thumbnail": a.thumbnail,
+            "user_message": a.user_message,
+            "health_status": a.health_status,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+            "confidence": a.confidence_score
+        } for a in analyses]
         return jsonify({"success": True, "analyses": result})
-
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
-    # ==================== FILE UPLOAD ROUTES ====================
 
 
 @app.route("/uploads/<filename>")
@@ -1407,17 +1481,51 @@ def uploaded_thumbnail(filename):
     return send_from_directory(app.config['THUMBNAIL_FOLDER'], filename)
 
 
-# ==================== STATIC FILE FIXES ====================
+# -------------------------------------------------------------------
+# WEATHER ROUTES
+# -------------------------------------------------------------------
 
-@app.route('/static/<path:filename>')
-def static_files(filename):
-    """Serve static files with proper error handling"""
-    try:
-        return send_from_directory(app.static_folder, filename)
-    except:
-        return "File not found", 404
+logging.basicConfig(level=logging.DEBUG)
 
-    # ==================== ADDITIONAL API ENDPOINTS ====================
+
+def generate_recommendations(weather):
+    recs = []
+    temp = weather.get('temperature', 28)
+    humidity = weather.get('humidity', 65)
+    wind_speed = float(weather.get('wind_speed', '12').split()[0])
+    rain_prob = weather.get('hourly', [{}])[0].get('pop', 0) if weather.get('hourly') else 40
+
+    if rain_prob > 60:
+        recs.append(("Irrigation", "warning", "Rain expected – skip irrigation today."))
+    elif temp > 35:
+        recs.append(("Irrigation", "success", "High temperature – irrigate early morning."))
+    else:
+        recs.append(("Irrigation", "success", "Normal conditions – irrigate as usual."))
+
+    if humidity > 80 and rain_prob > 40:
+        recs.append(("Pest Alert", "warning", "High humidity + rain – fungal disease risk. Apply preventive spray."))
+    else:
+        recs.append(("Pest Alert", "info", "Low pest risk."))
+
+    if rain_prob < 30 and wind_speed < 15:
+        recs.append(("Fertilizer", "info", "Good conditions for foliar spray."))
+    else:
+        recs.append(("Fertilizer", "secondary", "Wait for calmer weather to apply fertilizer."))
+
+    if rain_prob > 70:
+        recs.append(("Harvest", "danger", "Heavy rain expected – harvest ripe crops immediately."))
+    elif rain_prob > 30:
+        recs.append(("Harvest", "warning", "Rain possible – consider harvesting if crops are ready."))
+    else:
+        recs.append(("Harvest", "success", "Ideal weather for harvesting."))
+
+    return recs
+
+
+@app.route('/weather')
+@login_required
+def weather():
+    return render_template('weather.html')
 
 
 @app.route('/api/weather', methods=['GET'])
@@ -1425,25 +1533,124 @@ def static_files(filename):
 def get_weather():
     try:
         region = current_user.region or "Delhi"
+        api_key = current_app.config.get('WEATHER_API_KEY')
+        base_url = current_app.config.get('WEATHER_API_URL', 'https://api.openweathermap.org/data/2.5')
 
-        weather_data = {
+        if api_key and api_key != 'your_actual_key_here':
+            try:
+                current_params = {'q': region, 'appid': api_key, 'units': 'metric'}
+                current_resp = requests.get(f"{base_url}/weather", params=current_params, timeout=10)
+                current_resp.raise_for_status()
+                current = current_resp.json()
+
+                forecast_params = {'q': region, 'appid': api_key, 'units': 'metric'}
+                forecast_resp = requests.get(f"{base_url}/forecast", params=forecast_params, timeout=10)
+                forecast_resp.raise_for_status()
+                forecast = forecast_resp.json()
+
+                def format_time(timestamp):
+                    return datetime.fromtimestamp(timestamp).strftime('%H:%M')
+
+                weather_data = {
+                    "temperature": round(current['main']['temp']),
+                    "feels_like": round(current['main']['feels_like']),
+                    "humidity": current['main']['humidity'],
+                    "wind_speed": f"{round(current['wind']['speed'] * 3.6, 1)} km/h",
+                    "conditions": current['weather'][0]['description'].title(),
+                    "icon": current['weather'][0]['icon'],
+                    "sunrise": format_time(current['sys']['sunrise']),
+                    "sunset": format_time(current['sys']['sunset']),
+                    "visibility": round(current.get('visibility', 10000) / 1000, 1),
+                    "alerts": ["No severe weather alerts"],
+                    "uvi": 5,
+                    "hourly": [],
+                    "daily": []
+                }
+
+                for item in forecast['list'][:8]:
+                    dt = datetime.fromtimestamp(item['dt'])
+                    weather_data['hourly'].append({
+                        "time": dt.strftime('%I %p'),
+                        "temp": round(item['main']['temp']),
+                        "description": item['weather'][0]['description'].title(),
+                        "icon": item['weather'][0]['icon'],
+                        "pop": round(item['pop'] * 100)
+                    })
+
+                used_days = set()
+                for item in forecast['list']:
+                    day = datetime.fromtimestamp(item['dt']).strftime('%A')
+                    if day not in used_days and len(weather_data['daily']) < 5:
+                        used_days.add(day)
+                        weather_data['daily'].append({
+                            "day": day[:3],
+                            "high": round(item['main']['temp_max']),
+                            "low": round(item['main']['temp_min']),
+                            "description": item['weather'][0]['description'].title(),
+                            "icon": item['weather'][0]['icon'],
+                            "pop": round(item['pop'] * 100)
+                        })
+
+                weather_data['recommendations'] = generate_recommendations(weather_data)
+                return jsonify({"success": True, "weather": weather_data})
+            except Exception as e:
+                logging.error(f"Live API failed: {e}, using mock data")
+
+        mock_data = {
             "temperature": 28,
+            "feels_like": 30,
             "humidity": 65,
-            "rainfall": "10 mm expected",
             "wind_speed": "12 km/h",
             "conditions": "Partly Cloudy",
-            "forecast": [
-                {"day": "Today", "high": 30, "low": 22, "condition": "Sunny"},
-                {"day": "Tomorrow", "high": 29, "low": 23, "condition": "Partly Cloudy"},
-                {"day": "Day 3", "high": 31, "low": 24, "condition": "Clear"}
-            ],
+            "icon": "02d",
+            "sunrise": "06:15",
+            "sunset": "18:45",
+            "visibility": 10,
             "alerts": ["No severe weather alerts"],
-            "last_updated": datetime.now().isoformat()
+            "uvi": 5,
+            "hourly": [
+                {"time": "06 AM", "temp": 22, "description": "Clear", "icon": "01d", "pop": 0},
+                {"time": "09 AM", "temp": 25, "description": "Sunny", "icon": "01d", "pop": 0},
+                {"time": "12 PM", "temp": 28, "description": "Partly Cloudy", "icon": "02d", "pop": 10},
+                {"time": "03 PM", "temp": 29, "description": "Cloudy", "icon": "03d", "pop": 20},
+                {"time": "06 PM", "temp": 26, "description": "Light Rain", "icon": "10d", "pop": 40},
+                {"time": "09 PM", "temp": 23, "description": "Clear", "icon": "01n", "pop": 0},
+            ],
+            "daily": [
+                {"day": "Mon", "high": 30, "low": 22, "description": "Sunny", "icon": "01d", "pop": 0},
+                {"day": "Tue", "high": 29, "low": 23, "description": "Partly Cloudy", "icon": "02d", "pop": 10},
+                {"day": "Wed", "high": 28, "low": 22, "description": "Cloudy", "icon": "03d", "pop": 20},
+                {"day": "Thu", "high": 27, "low": 21, "description": "Rain", "icon": "10d", "pop": 60},
+                {"day": "Fri", "high": 26, "low": 20, "description": "Thunderstorm", "icon": "11d", "pop": 80},
+            ]
         }
-
-        return jsonify({"success": True, "weather": weather_data})
+        mock_data['recommendations'] = generate_recommendations(mock_data)
+        return jsonify({"success": True, "weather": mock_data})
     except Exception as e:
+        logging.error(f"Unexpected error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route('/update_location', methods=['POST'])
+@login_required
+def update_location():
+    data = request.get_json()
+    new_city = data.get('city')
+    if new_city:
+        current_user.region = new_city
+        db.session.commit()
+        return jsonify(success=True, city=new_city)
+    return jsonify(success=False, error="No city provided"), 400
+
+
+# -------------------------------------------------------------------
+# MARKET PRICES
+# -------------------------------------------------------------------
+
+@app.route('/market')
+@login_required
+def market_prices():
+    return render_template('market.html')
 
 
 @app.route('/api/market-prices', methods=['GET'])
@@ -1451,48 +1658,835 @@ def get_weather():
 def get_market_prices():
     try:
         prices = MarketPrice.query.order_by(MarketPrice.date.desc()).limit(10).all()
-
-        price_list = []
-        for price in prices:
-            price_list.append({
-                "crop": price.crop_name,
-                "price": price.price,
-                "unit": price.unit,
-                "market": price.market_name,
-                "region": price.region,
-                "date": price.date.isoformat() if price.date else None
-            })
-
+        price_list = [{
+            "crop": p.crop_name,
+            "price": p.price,
+            "unit": p.unit,
+            "market": p.market_name,
+            "region": p.region,
+            "date": p.date.isoformat() if p.date else None
+        } for p in prices]
         return jsonify({"success": True, "prices": price_list})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
+    # -------------------------------------------------------------------
+
+
+# PEST DATABASE
+# -------------------------------------------------------------------
+
+@app.route('/pest-database')
+@login_required
+def pest_database():
+    return render_template('pest_database.html')
+
+
+@app.route('/api/pests', methods=['GET'])
+@login_required
+def get_pests():
+    try:
+        pests = [
+            {"id": 1, "name": "Aphids", "crop_affected": "Tomato, Chilli, Cotton",
+             "symptoms": "Curling leaves, stunted growth", "control": "Neem oil spray, Imidacloprid"},
+            {"id": 2, "name": "Whiteflies", "crop_affected": "Tomato, Cotton, Soybean",
+             "symptoms": "Yellowing leaves, sooty mold", "control": "Yellow sticky traps, Acetamiprid"},
+            {"id": 3, "name": "Bollworms", "crop_affected": "Cotton, Chilli", "symptoms": "Holes in fruits/bolls",
+             "control": "Bt cotton, Spinosad"}
+        ]
+        return jsonify({"success": True, "pests": pests})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+    # -------------------------------------------------------------------
+
+
+# COMMUNITY FORUM
+# -------------------------------------------------------------------
+
+@app.route('/community')
+@login_required
+def community_forum():
+    categories = ForumCategory.query.order_by(ForumCategory.name).all()
+    recent_threads = ForumThread.query.order_by(
+        ForumThread.is_pinned.desc(),
+        ForumThread.updated_at.desc()
+    ).limit(10).all()
+    total_members = User.query.count()
+    online_members = User.query.filter(User.last_login >= datetime.now(timezone.utc) - timedelta(minutes=15)).count()
+    total_discussions = ForumThread.query.count()
+    total_solutions = ForumPost.query.filter_by(is_solution=True).count()
+    user_contributions = ForumThread.query.filter_by(user_id=current_user.id).count() + \
+                         ForumPost.query.filter_by(user_id=current_user.id).count()
+    week_ago = datetime.now(timezone.utc) - timedelta(days=7)
+    trending_tags = db.session.query(
+        ForumTag.name,
+        func.count(ForumThreadTag.thread_id).label('count')
+    ).join(ForumThreadTag).join(ForumThread).filter(
+        ForumThread.created_at >= week_ago
+    ).group_by(ForumTag.id).order_by(desc('count')).limit(4).all()
+    top_contributors = db.session.query(
+        User,
+        func.count(ForumPost.id).label('post_count')
+    ).join(ForumPost).group_by(User.id).order_by(desc('post_count')).limit(5).all()
+    return render_template('community.html',
+                           categories=categories,
+                           recent_threads=recent_threads,
+                           total_members=total_members,
+                           online_members=online_members,
+                           total_discussions=total_discussions,
+                           total_solutions=total_solutions,
+                           user_contributions=user_contributions,
+                           trending_tags=trending_tags,
+                           top_contributors=top_contributors)
+
+
+@app.route('/community/thread/<int:thread_id>')
+@login_required
+def view_thread(thread_id):
+    thread = ForumThread.query.get_or_404(thread_id)
+    thread.views += 1
+    db.session.commit()
+    return render_template('thread.html', thread=thread)
+
+
+@app.route('/community/thread/new', methods=['POST'])
+@login_required
+def create_thread():
+    title = request.form.get('title', '').strip()
+    category_id = request.form.get('category_id')
+    content = request.form.get('content', '').strip()
+    tags = request.form.getlist('tags')
+    if not title or not category_id or not content:
+        flash('All fields are required.', 'danger')
+        return redirect(url_for('community_forum'))
+    thread = ForumThread(
+        title=title,
+        content=content,
+        user_id=current_user.id,
+        category_id=category_id
+    )
+    db.session.add(thread)
+    db.session.flush()
+    for tag_name in tags:
+        tag = ForumTag.query.filter_by(name=tag_name).first()
+        if not tag:
+            tag = ForumTag(name=tag_name)
+            db.session.add(tag)
+            db.session.flush()
+        thread_tag = ForumThreadTag(thread_id=thread.id, tag_id=tag.id)
+        db.session.add(thread_tag)
+    category = ForumCategory.query.get(category_id)
+    if category:
+        category.thread_count += 1
+    db.session.commit()
+    flash('Thread created successfully!', 'success')
+    return redirect(url_for('view_thread', thread_id=thread.id))
+
+
+@app.route('/community/thread/<int:thread_id>/reply', methods=['POST'])
+@login_required
+def post_reply(thread_id):
+    thread = ForumThread.query.get_or_404(thread_id)
+    if thread.is_locked:
+        flash('This thread is locked.', 'warning')
+        return redirect(url_for('view_thread', thread_id=thread_id))
+    content = request.form.get('content', '').strip()
+    if not content:
+        flash('Reply cannot be empty.', 'danger')
+        return redirect(url_for('view_thread', thread_id=thread_id))
+    post = ForumPost(
+        content=content,
+        user_id=current_user.id,
+        thread_id=thread_id
+    )
+    db.session.add(post)
+    thread.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+    flash('Reply posted.', 'success')
+    return redirect(url_for('view_thread', thread_id=thread_id) + f'#post-{post.id}')
+
+
+@app.route('/api/community/post/<int:post_id>/like', methods=['POST'])
+@login_required
+def like_post(post_id):
+    post = ForumPost.query.get_or_404(post_id)
+    like = ForumLike.query.filter_by(user_id=current_user.id, post_id=post_id).first()
+    if like:
+        db.session.delete(like)
+        liked = False
+    else:
+        like = ForumLike(user_id=current_user.id, post_id=post_id)
+        db.session.add(like)
+        liked = True
+    db.session.commit()
+    return jsonify({'success': True, 'liked': liked, 'count': post.likes.count()})
+
+
+@app.route('/community/search')
+@login_required
+def search_threads():
+    q = request.args.get('q', '').strip()
+    if not q:
+        return redirect(url_for('community_forum'))
+    threads = ForumThread.query.filter(
+        (ForumThread.title.ilike(f'%{q}%')) |
+        (ForumThread.content.ilike(f'%{q}%'))
+    ).order_by(ForumThread.updated_at.desc()).all()
+    return render_template('community_search.html', threads=threads, query=q)
+
+
+@app.route('/debug/categories')
+@login_required
+def debug_categories():
+    cats = ForumCategory.query.all()
+    return jsonify([{'id': c.id, 'name': c.name} for c in cats])
+
+
+# -------------------------------------------------------------------
+# COMMUNITY LIVE CHAT
+# -------------------------------------------------------------------
+
+@app.route('/chat-community')
+@login_required
+def chat_community():
+    """General real-time chat room with initial messages"""
+    messages_query = db.session.query(
+        ChatMessage,
+        User.name.label('sender_name'),
+        User.role.label('sender_role'),
+        User.profile_picture.label('sender_profile_picture')
+    ).join(User, ChatMessage.sender_id == User.id) \
+        .filter(ChatMessage.room == 'general') \
+        .order_by(ChatMessage.created_at.desc()) \
+        .limit(50).all()
+
+    messages = []
+    for msg, sender_name, sender_role, sender_pic in reversed(messages_query):
+        # Get reactions for this message
+        reactions = {}
+        reaction_rows = db.session.query(
+            MessageReaction.emoji,
+            func.count(MessageReaction.id)
+        ).filter(MessageReaction.message_id == msg.id) \
+            .group_by(MessageReaction.emoji).all()
+        for emoji, count in reaction_rows:
+            reactions[emoji] = count
+
+            # Get reply preview if any
+        reply_to = None
+        if msg.reply_to_id:
+            reply_msg = ChatMessage.query.get(msg.reply_to_id)
+            if reply_msg:
+                reply_sender = User.query.get(reply_msg.sender_id)
+                reply_to = {
+                    'id': reply_msg.id,
+                    'sender': reply_sender.name if reply_sender else 'Unknown',
+                    'preview': (reply_msg.message[:50] + '...') if len(reply_msg.message) > 50 else reply_msg.message
+                }
+
+        messages.append({
+            'id': msg.id,
+            'sender_id': msg.sender_id,
+            'sender': {
+                'name': sender_name,
+                'role': sender_role,
+                'profile_picture': sender_pic
+            },
+            'message': msg.message,
+            'file_url': msg.file_url,
+            'file_type': msg.file_type,
+            'reply_to': reply_to,
+            'reactions': reactions,
+            'created_at': msg.created_at,
+            'read_by_all': False
+        })
+
+    return render_template('livechat.html', messages=messages)
+
+
+@app.route('/upload-chat-file', methods=['POST'])
+@login_required
+def upload_chat_file():
+    """Handle file uploads for chat (images, voice, etc.)"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file part'}), 400
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': 'No selected file'}), 400
+
+        filename = secure_filename(file.filename)
+        unique_name = f"{current_user.id}_{int(time.time())}_{filename}"
+        filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_name)
+        file.save(filepath)
+
+        from mimetypes import guess_type
+        mime_type, _ = guess_type(filename)
+        if not mime_type:
+            mime_type = 'application/octet-stream'
+
+        file_url = url_for('uploaded_file', filename=unique_name, _external=True)
+
+        return jsonify({'file_url': file_url, 'file_type': mime_type})
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/follow/<int:user_id>', methods=['POST'])
+@login_required
+def follow_user(user_id):
+    """Follow another user"""
+    if user_id == current_user.id:
+        return jsonify({'error': 'Cannot follow yourself'}), 400
+    user = db.session.get(User, user_id)
+    if not user:
+        return jsonify({'error': 'User not found'}), 404
+
+    existing = UserFollow.query.filter_by(follower_id=current_user.id, followed_id=user_id).first()
+    if existing:
+        return jsonify({'message': 'Already following'}), 200
+
+    follow = UserFollow(follower_id=current_user.id, followed_id=user_id)
+    db.session.add(follow)
+    db.session.commit()
+    return jsonify({'success': True, 'message': f'Now following {user.name}'})
+
+
+@app.route('/unfollow/<int:user_id>', methods=['POST'])
+@login_required
+def unfollow_user(user_id):
+    """Unfollow a user"""
+    follow = UserFollow.query.filter_by(follower_id=current_user.id, followed_id=user_id).first()
+    if follow:
+        db.session.delete(follow)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Unfollowed'})
+    return jsonify({'error': 'Not following'}), 404
+
+
+@app.route('/user/<int:user_id>/profile')
+@login_required
+def user_profile_snippet(user_id):
+    """Return HTML snippet for profile hover card"""
+    user = db.session.get(User, user_id)
+    if not user:
+        return 'User not found', 404
+
+    followers_count = UserFollow.query.filter_by(followed_id=user.id).count()
+    following_count = UserFollow.query.filter_by(follower_id=user.id).count()
+    is_following = UserFollow.query.filter_by(follower_id=current_user.id, followed_id=user.id).first() is not None
+
+    html = f""" 
+    <div class="p-2" style="min-width: 200px;"> 
+        <div class="d-flex align-items-center mb-2"> 
+            <div class="avatar me-2" style="width: 48px; height: 48px;"> 
+                {user.name[:2].upper()} 
+            </div> 
+            <div> 
+                <strong>{user.name}</strong><br> 
+                <small class="text-muted">@{user.email.split('@')[0]}</small> 
+            </div> 
+        </div> 
+        <p><i class="bi bi-geo-alt"></i> {user.region or 'Unknown'}</p> 
+        <p><i class="bi bi-tree"></i> {user.primary_crop or 'Not specified'}</p> 
+        <div class="d-flex justify-content-between"> 
+            <span><strong>{followers_count}</strong> Followers</span> 
+            <span><strong>{following_count}</strong> Following</span> 
+        </div> 
+        {'<button class="btn btn-sm btn-primary mt-2 w-100" onclick="toggleFollow(' + str(user.id) + ')">Unfollow</button>' if is_following else '<button class="btn btn-sm btn-outline-primary mt-2 w-100" onclick="toggleFollow(' + str(user.id) + ')">Follow</button>'} 
+    </div> 
+    """
+    return html
+
+
+@app.route('/messages/send/<int:user_id>')
+@login_required
+def send_private_message(user_id):
+    # Placeholder for private messaging
+    flash('Private messaging coming soon!', 'info')
+    return redirect(url_for('chat_community'))
+
+
+# -------------------------------------------------------------------
+# SOCKET.IO EVENT HANDLERS
+# -------------------------------------------------------------------
+
+# Online user tracking
+online_users = {}  # room -> set of user ids
+user_sid_map = {}  # sid -> user_id
+
+
+@socketio.on('join')
+def handle_join(data):
+    room = data.get('room')
+    username = data.get('username')
+    user_id = current_user.id
+
+    join_room(room)
+    user_sid_map[request.sid] = user_id
+
+    if room not in online_users:
+        online_users[room] = set()
+    online_users[room].add(user_id)
+
+    emit('status', {'msg': f'{username} has joined the chat.'}, room=room, include_self=False)
+    broadcast_online_users(room)
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    sid = request.sid
+    user_id = user_sid_map.get(sid)
+    if user_id:
+        for room, users in list(online_users.items()):
+            if user_id in users:
+                users.remove(user_id)
+                broadcast_online_users(room)
+        del user_sid_map[sid]
+
+
+def broadcast_online_users(room):
+    if room not in online_users:
+        return
+    user_list = []
+    for uid in online_users[room]:
+        user = User.query.get(uid)
+        if user:
+            user_list.append({
+                'id': user.id,
+                'name': user.name,
+                'role': user.role
+            })
+    emit('user_count', {'count': len(user_list), 'users': user_list}, room=room)
+
+
+@socketio.on('typing')
+def handle_typing(data):
+    room = data.get('room')
+    sender = data.get('sender')
+    sender_id = data.get('sender_id')
+    emit('typing', {'sender': sender, 'sender_id': sender_id}, room=room, include_self=False)
+
+
+@socketio.on('send_message')
+def handle_send_message(data):
+    room = data['room']
+    msg_text = data.get('message', '')
+    file_url = data.get('file_url')
+    file_type = data.get('file_type')
+    reply_to_id = data.get('reply_to_id')
+    sender_id = data['sender_id']
+    sender_name = data['sender']
+
+    new_msg = ChatMessage(
+        sender_id=sender_id,
+        room=room,
+        message=msg_text,
+        file_url=file_url,
+        file_type=file_type,
+        reply_to_id=reply_to_id
+    )
+    db.session.add(new_msg)
+    db.session.commit()
+
+    sender = User.query.get(sender_id)
+    sender_avatar = sender.profile_picture if sender else None
+
+    reply_to = None
+    if reply_to_id:
+        reply_msg = ChatMessage.query.get(reply_to_id)
+        if reply_msg:
+            reply_sender = User.query.get(reply_msg.sender_id)
+            reply_to = {
+                'id': reply_msg.id,
+                'sender': reply_sender.name if reply_sender else 'Unknown',
+                'preview': (reply_msg.message[:50] + '...') if len(reply_msg.message) > 50 else reply_msg.message
+            }
+
+    timeago = datetime.now(timezone.utc).strftime('%H:%M')
+
+    emit('message', {
+        'id': new_msg.id,
+        'sender': sender_name,
+        'sender_id': sender_id,
+        'sender_avatar': sender_avatar,
+        'message': msg_text,
+        'file_url': file_url,
+        'file_type': file_type,
+        'reply_to': reply_to,
+        'timeago': timeago,
+        'reactions': {}
+    }, room=room)
+
+
+@socketio.on('edit_message')
+def handle_edit_message(data):
+    msg_id = data['id']
+    new_text = data['message']
+    room = data['room']
+
+    msg = ChatMessage.query.get(msg_id)
+    if not msg or msg.sender_id != current_user.id:
+        return
+
+    msg.message = new_text
+    db.session.commit()
+    emit('message_edited', {'id': msg_id, 'message': new_text}, room=room)
+
+
+@socketio.on('delete_message')
+def handle_delete_message(data):
+    msg_id = data['id']
+    room = data['room']
+
+    msg = ChatMessage.query.get(msg_id)
+    if not msg:
+        return
+    if msg.sender_id != current_user.id and current_user.role not in ['admin', 'moderator']:
+        return
+
+    db.session.delete(msg)
+    db.session.commit()
+    emit('message_deleted', {'id': msg_id}, room=room)
+
+
+@socketio.on('pin_message')
+def handle_pin_message(data):
+    if current_user.role not in ['admin', 'moderator']:
+        return
+    msg_id = data['id']
+    room = data['room']
+    emit('message_pinned', {'id': msg_id, 'message': 'Message pinned'}, room=room)
+
+
+@socketio.on('reaction')
+def handle_reaction(data):
+    msg_id = data['message_id']
+    emoji = data['emoji']
+    room = data['room']
+
+    reaction = MessageReaction.query.filter_by(
+        message_id=msg_id,
+        user_id=current_user.id,
+        emoji=emoji
+    ).first()
+
+    if reaction:
+        db.session.delete(reaction)
+        added = False
+    else:
+        reaction = MessageReaction(
+            message_id=msg_id,
+            user_id=current_user.id,
+            emoji=emoji
+        )
+        db.session.add(reaction)
+        added = True
+    db.session.commit()
+
+    count = MessageReaction.query.filter_by(message_id=msg_id, emoji=emoji).count()
+
+    emit('reaction_update', {
+        'message_id': msg_id,
+        'emoji': emoji,
+        'count': count,
+        'user_id': current_user.id,
+        'added': added
+    }, room=room)
+
+
+@socketio.on('messages_seen')
+def handle_messages_seen(data):
+    room = data['room']
+    last_seen_id = data['last_seen_id']
+    emit('read_receipt', {
+        'user_id': current_user.id,
+        'user_name': current_user.name,
+        'last_seen_id': last_seen_id
+    }, room=room, include_self=False)
+
+
+# -------------------------------------------------------------------
+# DOCUMENTS
+# -------------------------------------------------------------------
+
+@app.route('/documents')
+@login_required
+def document_center():
+    return render_template('docs.html')
+
+
+@app.route('/documents/list/')
+@login_required
+def document_list():
+    docs = Document.query.filter_by(user_id=current_user.id).order_by(Document.uploaded_at.desc()).all()
+    data = [{
+        'id': doc.id,
+        'name': doc.name,
+        'type': doc.file_type,
+        'size': doc.formatted_size(),
+        'date': doc.uploaded_at.strftime('%Y-%m-%d'),
+        'category': doc.category,
+        'description': doc.description,
+        'url': doc.url,
+    } for doc in docs]
+    return jsonify(data)
+
+
+@app.route('/documents/upload/', methods=['POST'])
+@login_required
+def document_upload():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file part'}), 400
+    files = request.files.getlist('file')
+    uploaded = []
+    for file in files:
+        if file.filename == '':
+            continue
+        orig_filename = secure_filename(file.filename)
+        name, ext = os.path.splitext(orig_filename)
+        timestamp = int(time.time())
+        filename = f"{name}_{timestamp}{ext}"
+        filepath = os.path.join(current_app.config['UPLOAD_FOLDER_DOCS'], filename)
+        file.save(filepath)
+        ext_lower = ext.lower().lstrip('.')
+        if ext_lower in ['jpg', 'jpeg', 'png', 'gif', 'bmp']:
+            file_type = 'image'
+        elif ext_lower == 'pdf':
+            file_type = 'pdf'
+        elif ext_lower in ['doc', 'docx']:
+            file_type = 'docs'
+        elif ext_lower in ['xls', 'xlsx', 'csv']:
+            file_type = 'spreadsheet'
+        elif ext_lower in ['zip', 'rar', '7z']:
+            file_type = 'archive'
+        else:
+            file_type = 'other'
+        doc = Document(
+            name=orig_filename,
+            filename=filename,
+            file_type=file_type,
+            size=os.path.getsize(filepath),
+            description=request.form.get('description', ''),
+            category=request.form.get('category', 'uploads'),
+            user_id=current_user.id
+        )
+        db.session.add(doc)
+        db.session.commit()
+        uploaded.append({
+            'id': doc.id,
+            'name': doc.name,
+            'type': doc.file_type,
+            'size': doc.formatted_size(),
+            'date': doc.uploaded_at.strftime('%Y-%m-%d'),
+            'category': doc.category,
+            'description': doc.description,
+            'url': doc.url,
+        })
+    return jsonify({'success': True, 'documents': uploaded})
+
+
+@app.route('/documents/download/<int:doc_id>/')
+@login_required
+def document_download(doc_id):
+    doc = Document.query.get_or_404(doc_id)
+    if doc.user_id != current_user.id:
+        abort(403)
+    return send_file(doc.path, as_attachment=True, download_name=doc.name)
+
+
+@app.route('/uploads/documents/<path:filename>')
+def uploaded_document(filename):
+    return send_from_directory(app.config['UPLOAD_FOLDER_DOCS'], filename)
+
+
+# -------------------------------------------------------------------
+# NOTIFICATIONS
+# -------------------------------------------------------------------
+
+@app.route('/notifications')
+@login_required
+def notifications():
+    return render_template('notifications.html')
+
+
+# -------------------------------------------------------------------
+# CROP PLANNER
+# -------------------------------------------------------------------
+
+@app.route('/crop-planner')
+@login_required
+def crop_planner():
+    today = datetime.now().date()
+    if 3 <= today.month <= 6:
+        season = "Rabi"
+    elif 7 <= today.month <= 10:
+        season = "Kharif"
+    else:
+        season = "Zaid"
+    active_plans = CropPlan.query.filter_by(
+        user_id=current_user.id, is_active=True
+    ).order_by(CropPlan.start_date).all()
+    for plan in active_plans:
+        plan.days_since = (today - plan.start_date).days if plan.start_date else 0
+        plan.days_to_harvest = (plan.expected_harvest - today).days if plan.expected_harvest else 0
+    upcoming_tasks = CropTask.query.join(CropPlan).filter(
+        CropPlan.user_id == current_user.id,
+        CropPlan.is_active == True,
+        CropTask.status == 'pending',
+        CropTask.due_date >= today
+    ).order_by(CropTask.due_date).limit(10).all()
+    return render_template('crop_planner.html',
+                           season=season,
+                           active_plans=active_plans,
+                           upcoming_tasks=upcoming_tasks,
+                           current_user=current_user,
+                           today=today)
+
+
+@app.route('/api/crop-planner/create', methods=['POST'])
+@login_required
+def create_crop_plan():
+    try:
+        if request.is_json:
+            data = request.get_json()
+        else:
+            data = request.form
+        crop_type = data.get('crop_type')
+        variety = data.get('variety')
+        start_date_str = data.get('start_date')
+        harvest_date_str = data.get('harvest_date')
+        area = data.get('area')
+        planting_method = data.get('planting_method')
+        notes = data.get('notes')
+        if not crop_type or not start_date_str or not harvest_date_str:
+            return jsonify({'success': False, 'error': 'Missing required fields'}), 400
+        try:
+            start_date = datetime.strptime(start_date_str, '%Y-%m-%d').date()
+            harvest_date = datetime.strptime(harvest_date_str, '%Y-%m-%d').date()
+            area = float(area) if area else None
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Invalid date or area format'}), 400
+        plan = CropPlan(
+            user_id=current_user.id,
+            crop_type=crop_type,
+            variety=variety,
+            start_date=start_date,
+            expected_harvest=harvest_date,
+            area=area,
+            planting_method=planting_method,
+            notes=notes,
+            is_active=True
+        )
+        db.session.add(plan)
+        db.session.commit()
+        generate_default_tasks(plan)
+        return jsonify({'success': True, 'plan_id': plan.id, 'message': 'Crop plan created successfully'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/crop-planner/plans', methods=['GET'])
+@login_required
+def get_crop_plans():
+    try:
+        plans = CropPlan.query.filter_by(user_id=current_user.id, is_active=True).all()
+        result = []
+        for plan in plans:
+            tasks = [{
+                'id': t.id,
+                'title': t.title,
+                'due_date': t.due_date.isoformat() if t.due_date else None,
+                'status': t.status,
+                'category': t.category
+            } for t in plan.tasks]
+            result.append({
+                'id': plan.id,
+                'crop_type': plan.crop_type,
+                'variety': plan.variety,
+                'start_date': plan.start_date.isoformat() if plan.start_date else None,
+                'expected_harvest': plan.expected_harvest.isoformat() if plan.expected_harvest else None,
+                'area': plan.area,
+                'planting_method': plan.planting_method,
+                'notes': plan.notes,
+                'tasks': tasks,
+                'created_at': plan.created_at.isoformat() if plan.created_at else None
+            })
+        return jsonify({'success': True, 'plans': result})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/crop-planner/task/<int:task_id>/update', methods=['POST'])
+@login_required
+def update_task_status(task_id):
+    try:
+        task = CropTask.query.get_or_404(task_id)
+        if task.plan.user_id != current_user.id:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+        data = request.get_json() or {}
+        new_status = data.get('status')
+        if new_status in ['pending', 'completed', 'skipped']:
+            task.status = new_status
+            if new_status == 'completed':
+                task.completed_at = datetime.now(timezone.utc)
+            else:
+                task.completed_at = None
+            db.session.commit()
+            return jsonify({'success': True, 'message': 'Task updated'})
+        else:
+            return jsonify({'success': False, 'error': 'Invalid status'}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/crop-planner/plan/<int:plan_id>/delete', methods=['DELETE'])
+@login_required
+def delete_crop_plan(plan_id):
+    try:
+        plan = CropPlan.query.get_or_404(plan_id)
+        if plan.user_id != current_user.id:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 403
+        db.session.delete(plan)
+        db.session.commit()
+        return jsonify({'success': True, 'message': 'Plan deleted'})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+    # -------------------------------------------------------------------
+
+
+# FARMING TIPS
+# -------------------------------------------------------------------
 
 @app.route('/api/farming-tips', methods=['GET'])
 @login_required
 def get_farming_tips():
     try:
         tips = FarmingTip.query.filter_by(is_active=True).order_by(FarmingTip.created_at.desc()).limit(10).all()
-
-        tip_list = []
-        for tip in tips:
-            tip_list.append({
-                "id": tip.id,
-                "title": tip.title,
-                "content": tip.content,
-                "category": tip.category,
-                "crop_type": tip.crop_type,
-                "region": tip.region,
-                "language": tip.language,
-                "created_at": tip.created_at.isoformat() if tip.created_at else None
-            })
-
+        tip_list = [{
+            "id": t.id,
+            "title": t.title,
+            "content": t.content,
+            "category": t.category,
+            "crop_type": t.crop_type,
+            "region": t.region,
+            "language": t.language,
+            "created_at": t.created_at.isoformat() if t.created_at else None
+        } for t in tips]
         return jsonify({"success": True, "tips": tip_list})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-    # ==================== ADMIN ROUTES ====================
+    # -------------------------------------------------------------------
 
+
+# ADMIN ROUTES
+# -------------------------------------------------------------------
 
 @app.route("/admin")
 @login_required
@@ -1502,33 +2496,22 @@ def admin_dashboard():
         total_users = User.query.count()
         total_farmers = User.query.filter_by(role='farmer').count()
         total_admins = User.query.filter_by(role='admin').count()
-
         total_chats = ChatHistory.query.count()
         today = datetime.now().date()
         todays_chats = ChatHistory.query.filter(
             func.date(ChatHistory.created_at) == today
         ).count()
-
         total_images = ImageAnalysis.query.count()
-
         week_ago = datetime.now() - timedelta(days=7)
-        new_users_week = User.query.filter(
-            User.created_at >= week_ago
-        ).count()
-
+        new_users_week = User.query.filter(User.created_at >= week_ago).count()
         recent_users = User.query.order_by(User.id.desc()).limit(10).all()
         recent_chats = ChatHistory.query.order_by(ChatHistory.created_at.desc()).limit(10).all()
-
         active_users = db.session.query(
             User, func.count(ChatHistory.id).label('chat_count')
-        ).join(ChatHistory).group_by(User.id).order_by(
-            desc('chat_count')
-        ).limit(10).all()
-
+        ).join(ChatHistory).group_by(User.id).order_by(desc('chat_count')).limit(10).all()
         regions = db.session.query(
             User.region, func.count(User.id).label('user_count')
         ).filter(User.region.isnot(None), User.region != '').group_by(User.region).all()
-
         return render_template("admin_dashboard.html",
                                total_users=total_users,
                                total_farmers=total_farmers,
@@ -1541,7 +2524,6 @@ def admin_dashboard():
                                chats=recent_chats,
                                active_users=active_users,
                                regions=regions)
-
     except Exception as e:
         print(f"Admin dashboard error: {e}")
         flash(f"Error loading dashboard: {str(e)}", "danger")
@@ -1558,9 +2540,7 @@ def admin_users():
         search = request.args.get('search', '').strip()
         role_filter = request.args.get('role', 'all')
         status_filter = request.args.get('status', 'all')
-
         query = User.query
-
         if search:
             query = query.filter(
                 (User.name.ilike(f'%{search}%')) |
@@ -1568,25 +2548,20 @@ def admin_users():
                 (User.phone.ilike(f'%{search}%')) |
                 (User.region.ilike(f'%{search}%'))
             )
-
         if role_filter != 'all':
             query = query.filter_by(role=role_filter)
-
         if status_filter == 'active':
             query = query.filter_by(is_active=True)
         elif status_filter == 'inactive':
             query = query.filter_by(is_active=False)
-
         users = query.order_by(User.id.desc()).paginate(
             page=page, per_page=per_page, error_out=False
         )
-
         total_all = User.query.count()
         total_farmers = User.query.filter_by(role='farmer').count()
         total_admins = User.query.filter_by(role='admin').count()
         total_active = User.query.filter_by(is_active=True).count()
         total_inactive = User.query.filter_by(is_active=False).count()
-
         return render_template("admin/users.html",
                                users=users,
                                search=search,
@@ -1597,7 +2572,6 @@ def admin_users():
                                total_admins=total_admins,
                                total_active=total_active,
                                total_inactive=total_inactive)
-
     except Exception as e:
         flash(f"Error loading users: {str(e)}", "danger")
         return redirect(url_for('admin_dashboard'))
@@ -1612,12 +2586,9 @@ def admin_chats():
         per_page = request.args.get('per_page', 50, type=int)
         user_id = request.args.get('user_id', type=int)
         date_filter = request.args.get('date', 'all')
-
         query = ChatHistory.query
-
         if user_id:
             query = query.filter_by(user_id=user_id)
-
         if date_filter == 'today':
             today = datetime.now().date()
             query = query.filter(func.date(ChatHistory.created_at) == today)
@@ -1627,19 +2598,15 @@ def admin_chats():
         elif date_filter == 'month':
             month_ago = datetime.now() - timedelta(days=30)
             query = query.filter(ChatHistory.created_at >= month_ago)
-
         chats = query.order_by(ChatHistory.created_at.desc()).paginate(
             page=page, per_page=per_page, error_out=False
         )
-
         users_with_chats = User.query.join(ChatHistory).distinct().all()
-
         return render_template("admin/chats.html",
                                chats=chats,
                                users=users_with_chats,
                                selected_user_id=user_id,
                                date_filter=date_filter)
-
     except Exception as e:
         flash(f"Error loading chats: {str(e)}", "danger")
         return redirect(url_for('admin_dashboard'))
@@ -1654,18 +2621,14 @@ def admin_view_user(user_id):
         if not user:
             flash("User not found", "danger")
             return redirect(url_for('admin_users'))
-
         total_chats = ChatHistory.query.filter_by(user_id=user.id).count()
         total_images = ImageAnalysis.query.filter_by(user_id=user.id).count()
-
         recent_chats = ChatHistory.query.filter_by(user_id=user.id).order_by(
             ChatHistory.created_at.desc()
         ).limit(50).all()
-
         recent_images = ImageAnalysis.query.filter_by(user_id=user.id).order_by(
             ImageAnalysis.created_at.desc()
         ).limit(20).all()
-
         daily_chats = db.session.query(
             func.date(ChatHistory.created_at).label('date'),
             func.count(ChatHistory.id).label('count')
@@ -1677,7 +2640,6 @@ def admin_view_user(user_id):
         ).order_by(
             func.date(ChatHistory.created_at).desc()
         ).all()
-
         return render_template("admin/view_user.html",
                                user=user,
                                total_chats=total_chats,
@@ -1685,7 +2647,6 @@ def admin_view_user(user_id):
                                chats=recent_chats,
                                images=recent_images,
                                daily_chats=daily_chats)
-
     except Exception as e:
         flash(f"Error loading user details: {str(e)}", "danger")
         return redirect(url_for('admin_users'))
@@ -1700,25 +2661,19 @@ def admin_toggle_user_status(user_id):
         if not user:
             flash("User not found", "danger")
             return redirect(url_for('admin_users'))
-
         if user.id == current_user.id:
             flash("You cannot modify your own status", "warning")
             return redirect(url_for('admin_view_user', user_id=user_id))
-
         if user.role == 'admin' and user.id != current_user.id:
             flash("Cannot modify other admin users", "warning")
             return redirect(url_for('admin_view_user', user_id=user_id))
-
         user.is_active = not user.is_active
         db.session.commit()
-
         status = "activated" if user.is_active else "deactivated"
         flash(f"User {user.email} has been {status}", "success")
-
     except Exception as e:
         db.session.rollback()
         flash(f"Error updating user status: {str(e)}", "danger")
-
     return redirect(url_for('admin_view_user', user_id=user_id))
 
 
@@ -1731,25 +2686,19 @@ def admin_update_user_role(user_id):
         if not user:
             flash("User not found", "danger")
             return redirect(url_for('admin_users'))
-
         if user.id == current_user.id:
             flash("You cannot modify your own role", "warning")
             return redirect(url_for('admin_view_user', user_id=user_id))
-
         new_role = request.form.get('role', 'farmer')
         if new_role not in ['farmer', 'admin', 'agent']:
             flash("Invalid role specified", "danger")
             return redirect(url_for('admin_view_user', user_id=user_id))
-
         user.role = new_role
         db.session.commit()
-
         flash(f"User role updated to {new_role}", "success")
-
     except Exception as e:
         db.session.rollback()
         flash(f"Error updating user role: {str(e)}", "danger")
-
     return redirect(url_for('admin_view_user', user_id=user_id))
 
 
@@ -1762,29 +2711,21 @@ def admin_delete_user(user_id):
         if not user:
             flash("User not found", "danger")
             return redirect(url_for('admin_users'))
-
         if user.id == current_user.id:
             flash("You cannot delete your own account", "warning")
             return redirect(url_for('admin_users'))
-
         if user.role == 'admin':
             flash("Cannot delete admin users", "warning")
             return redirect(url_for('admin_users'))
-
         user_email = user.email
-
         ChatHistory.query.filter_by(user_id=user_id).delete()
         ImageAnalysis.query.filter_by(user_id=user_id).delete()
-
         db.session.delete(user)
         db.session.commit()
-
         flash(f"User {user_email} deleted successfully", "success")
-
     except Exception as e:
         db.session.rollback()
         flash(f"Error deleting user: {str(e)}", "danger")
-
     return redirect(url_for('admin_users'))
 
 
@@ -1796,54 +2737,28 @@ def admin_analytics():
         user_growth = db.session.query(
             func.date(User.created_at).label('date'),
             func.count(User.id).label('count')
-        ).group_by(
-            func.date(User.created_at)
-        ).order_by(
-            func.date(User.created_at)
-        ).all()
-
+        ).group_by(func.date(User.created_at)).order_by(func.date(User.created_at)).all()
         chat_activity = db.session.query(
             func.date(ChatHistory.created_at).label('date'),
             func.count(ChatHistory.id).label('count')
-        ).group_by(
-            func.date(ChatHistory.created_at)
-        ).order_by(
-            func.date(ChatHistory.created_at)
-        ).all()
-
+        ).group_by(func.date(ChatHistory.created_at)).order_by(func.date(ChatHistory.created_at)).all()
         top_crops = db.session.query(
             User.primary_crop,
             func.count(User.id).label('user_count')
-        ).filter(
-            User.primary_crop.isnot(None),
-            User.primary_crop != ''
-        ).group_by(
-            User.primary_crop
-        ).order_by(
-            desc('user_count')
-        ).limit(10).all()
-
+        ).filter(User.primary_crop.isnot(None), User.primary_crop != '').group_by(User.primary_crop).order_by(
+            desc('user_count')).limit(10).all()
         total_users = User.query.count()
         active_users = db.session.query(
             func.count(func.distinct(ChatHistory.user_id))
-        ).filter(
-            ChatHistory.created_at >= datetime.now() - timedelta(days=30)
-        ).scalar() or 0
-
+        ).filter(ChatHistory.created_at >= datetime.now() - timedelta(days=30)).scalar() or 0
         avg_chats_per_user = db.session.query(
             func.avg(db.session.query(
                 func.count(ChatHistory.id)
-            ).filter(
-                ChatHistory.created_at >= datetime.now() - timedelta(days=30)
-            ).group_by(
-                ChatHistory.user_id
-            ).subquery().c.count)
+            ).filter(ChatHistory.created_at >= datetime.now() - timedelta(days=30)).group_by(
+                ChatHistory.user_id).subquery().c.count)
         ).scalar() or 0
-
-        # Get additional counts for the template
         total_chats = ChatHistory.query.count()
         total_images = ImageAnalysis.query.count()
-
         return render_template("admin/analytics.html",
                                user_growth=user_growth,
                                chat_activity=chat_activity,
@@ -1853,7 +2768,6 @@ def admin_analytics():
                                avg_chats_per_user=round(avg_chats_per_user, 2),
                                total_chats=total_chats,
                                total_images=total_images)
-
     except Exception as e:
         flash(f"Error loading analytics: {str(e)}", "danger")
         return redirect(url_for('admin_dashboard'))
@@ -1865,15 +2779,10 @@ def admin_analytics():
 def admin_export_users():
     try:
         users = User.query.order_by(User.id.desc()).all()
-
         output = StringIO()
         writer = csv.writer(output)
-
-        writer.writerow([
-            'ID', 'Email', 'Name', 'Phone', 'Role', 'Region', 'Farm Size',
-            'Primary Crop', 'Experience Level', 'Status', 'Created At'
-        ])
-
+        writer.writerow(['ID', 'Email', 'Name', 'Phone', 'Role', 'Region', 'Farm Size',
+                         'Primary Crop', 'Experience Level', 'Status', 'Created At'])
         for user in users:
             writer.writerow([
                 user.id,
@@ -1888,14 +2797,12 @@ def admin_export_users():
                 'Active' if user.is_active else 'Inactive',
                 user.created_at.strftime('%Y-%m-%d %H:%M:%S') if user.created_at else ''
             ])
-
         output.seek(0)
         return app.response_class(
             output.getvalue(),
             mimetype='text/csv',
             headers={'Content-Disposition': 'attachment; filename=users_export.csv'}
         )
-
     except Exception as e:
         flash(f"Error exporting users: {str(e)}", "danger")
         return redirect(url_for('admin_users'))
@@ -1907,15 +2814,9 @@ def admin_export_users():
 def admin_export_chats():
     try:
         chats = ChatHistory.query.order_by(ChatHistory.created_at.desc()).limit(1000).all()
-
         output = StringIO()
         writer = csv.writer(output)
-
-        writer.writerow([
-            'ID', 'User ID', 'User Message', 'Bot Response', 'Type',
-            'Language', 'Created At'
-        ])
-
+        writer.writerow(['ID', 'User ID', 'User Message', 'Bot Response', 'Type', 'Language', 'Created At'])
         for chat in chats:
             writer.writerow([
                 chat.id,
@@ -1924,16 +2825,14 @@ def admin_export_chats():
                 (chat.bot_response or '')[:500],
                 chat.chat_type or '',
                 chat.language or '',
-                chat.created_at.strftime('%Y-%m-d %H:%M:%S') if chat.created_at else ''
+                chat.created_at.strftime('%Y-%m-%d %H:%M:%S') if chat.created_at else ''
             ])
-
         output.seek(0)
         return app.response_class(
             output.getvalue(),
             mimetype='text/csv',
             headers={'Content-Disposition': 'attachment; filename=chats_export.csv'}
         )
-
     except Exception as e:
         flash(f"Error exporting chats: {str(e)}", "danger")
         return redirect(url_for('admin_chats'))
@@ -1946,11 +2845,9 @@ def admin_knowledge_base():
     try:
         farming_tips = FarmingTip.query.order_by(FarmingTip.created_at.desc()).all()
         market_prices = MarketPrice.query.order_by(MarketPrice.date.desc()).limit(50).all()
-
         return render_template("admin/knowledge_base.html",
                                farming_tips=farming_tips,
                                market_prices=market_prices)
-
     except Exception as e:
         flash(f"Error loading knowledge base: {str(e)}", "danger")
         return redirect(url_for('admin_dashboard'))
@@ -1966,11 +2863,9 @@ def admin_add_farming_tip():
         category = request.form.get("category", "general")
         crop_type = request.form.get("crop_type")
         language = request.form.get("language", "en")
-
         if not title or not content:
             flash("Title and content are required", "danger")
             return redirect(url_for('admin_knowledge_base'))
-
         tip = FarmingTip(
             title=title,
             content=content,
@@ -1978,16 +2873,12 @@ def admin_add_farming_tip():
             crop_type=crop_type,
             language=language
         )
-
         db.session.add(tip)
         db.session.commit()
-
         flash("Farming tip added successfully", "success")
-
     except Exception as e:
         db.session.rollback()
         flash(f"Error adding farming tip: {str(e)}", "danger")
-
     return redirect(url_for('admin_knowledge_base'))
 
 
@@ -2002,11 +2893,9 @@ def admin_add_market_price():
         price = request.form.get("price", type=float)
         unit = request.form.get("unit", "kg")
         source = request.form.get("source", "")
-
         if not crop_name or not price:
             flash("Crop name and price are required", "danger")
             return redirect(url_for('admin_knowledge_base'))
-
         price_entry = MarketPrice(
             crop_name=crop_name,
             market_name=market_name,
@@ -2015,16 +2904,12 @@ def admin_add_market_price():
             unit=unit,
             source=source
         )
-
         db.session.add(price_entry)
         db.session.commit()
-
         flash("Market price added successfully", "success")
-
     except Exception as e:
         db.session.rollback()
         flash(f"Error adding market price: {str(e)}", "danger")
-
     return redirect(url_for('admin_knowledge_base'))
 
 
@@ -2036,13 +2921,10 @@ def admin_clear_all_chats():
         count = ChatHistory.query.count()
         ChatHistory.query.delete()
         db.session.commit()
-
         flash(f"Cleared {count} chat records", "success")
-
     except Exception as e:
         db.session.rollback()
         flash(f"Error clearing chats: {str(e)}", "danger")
-
     return redirect(url_for('admin_dashboard'))
 
 
@@ -2056,17 +2938,14 @@ def admin_system_health():
             db.session.execute("SELECT 1")
         except Exception as e:
             db_status = f"Error: {str(e)}"
-
         upload_folder_exists = os.path.exists(app.config['UPLOAD_FOLDER'])
         upload_folder_writable = os.access(app.config['UPLOAD_FOLDER'], os.W_OK)
-
         gemini_status = {
             "enabled": GEMINI_ENABLED,
             "api_key_configured": bool(GEMINI_API_KEY and GEMINI_API_KEY != "not_set"),
             "has_client": gemini_client is not None,
             "status": "Working" if GEMINI_ENABLED else "Disabled"
         }
-
         total, used, free = shutil.disk_usage("/")
         disk_usage = {
             'total_gb': round(total / (1024 ** 3), 2),
@@ -2074,29 +2953,43 @@ def admin_system_health():
             'free_gb': round(free / (1024 ** 3), 2),
             'percent_used': round((used / total) * 100, 2)
         }
-
         return render_template("admin/system_health.html",
                                db_status=db_status,
                                upload_folder_exists=upload_folder_exists,
                                upload_folder_writable=upload_folder_writable,
                                gemini_status=gemini_status,
                                disk_usage=disk_usage)
-
     except Exception as e:
         flash(f"Error checking system health: {str(e)}", "danger")
         return redirect(url_for('admin_dashboard'))
 
 
+@app.route("/admin/delete-chat/<int:chat_id>", methods=["POST"])
+@login_required
+@admin_required
+def admin_delete_chat(chat_id):
+    try:
+        chat = ChatHistory.query.get_or_404(chat_id)
+        db.session.delete(chat)
+        db.session.commit()
+        flash("Chat deleted successfully", "success")
+    except Exception as e:
+        db.session.rollback()
+        flash(f"Error deleting chat: {str(e)}", "danger")
+    return redirect(request.referrer or url_for('admin_chats'))
+
+
+# -------------------------------------------------------------------
+# UTILITY ROUTES
+# -------------------------------------------------------------------
+
 @app.route('/api/crop-schedule', methods=['POST'])
 @login_required
 def crop_schedule():
-    """Generate crop schedule"""
     try:
         data = request.get_json() or {}
         crop = data.get('crop', '')
         region = current_user.region or 'India'
-
-        # Basic crop schedule
         schedule = {
             "crop": crop,
             "region": region,
@@ -2112,45 +3005,9 @@ def crop_schedule():
             "water_requirements": "Regular irrigation, avoid waterlogging",
             "harvest_time": "90-120 days after planting"
         }
-
         return jsonify({"success": True, "schedule": schedule})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
-
-
-@app.route('/api/pests', methods=['GET'])
-@login_required
-def get_pests():
-    """Get pest database"""
-    try:
-        pests = [
-            {
-                "id": 1,
-                "name": "Aphids",
-                "crop_affected": "Tomato, Chilli, Cotton",
-                "symptoms": "Curling leaves, stunted growth",
-                "control": "Neem oil spray, Imidacloprid"
-            },
-            {
-                "id": 2,
-                "name": "Whiteflies",
-                "crop_affected": "Tomato, Cotton, Soybean",
-                "symptoms": "Yellowing leaves, sooty mold",
-                "control": "Yellow sticky traps, Acetamiprid"
-            },
-            {
-                "id": 3,
-                "name": "Bollworms",
-                "crop_affected": "Cotton, Chilli",
-                "symptoms": "Holes in fruits/bolls",
-                "control": "Bt cotton, Spinosad"
-            }
-        ]
-        return jsonify({"success": True, "pests": pests})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-    # ==================== UTILITY ROUTES ====================
 
 
 @app.route("/health")
@@ -2167,7 +3024,6 @@ def health_check():
 def sitemap():
     pages = []
     now = datetime.now().isoformat()[:10]
-
     static_pages = ['home', 'features', 'pricing', 'about', 'contact', 'login', 'register']
     for page in static_pages:
         pages.append({
@@ -2176,7 +3032,6 @@ def sitemap():
             'changefreq': 'daily',
             'priority': '0.8'
         })
-
     if current_user.is_authenticated:
         pages.append({
             'loc': url_for('dashboard', _external=True),
@@ -2190,7 +3045,6 @@ def sitemap():
             'changefreq': 'always',
             'priority': '1.0'
         })
-
     sitemap_xml = render_template('sitemap.xml', pages=pages)
     response = app.response_class(sitemap_xml, mimetype='application/xml')
     return response
@@ -2198,16 +3052,10 @@ def sitemap():
 
 @app.route("/init-db")
 def init_db():
-    """Initialize database with sample data"""
     try:
-        # Create all tables
         db.create_all()
-
-        # Check if default users exist
         admin_user = User.query.filter_by(email='admin@aiagrobot.com').first()
         if not admin_user:
-            print("📁 Creating default users and sample data...")
-
             admin_user = User(
                 email='admin@aiagrobot.com',
                 name='Admin',
@@ -2223,7 +3071,6 @@ def init_db():
             )
             admin_user.set_password('admin123')
             db.session.add(admin_user)
-
             demo_user = User(
                 email='demo@aiagrobot.com',
                 name='Demo Farmer',
@@ -2239,78 +3086,40 @@ def init_db():
             )
             demo_user.set_password('demo123')
             db.session.add(demo_user)
-
             sample_tips = [
-                FarmingTip(
-                    title="Watering Best Practices",
-                    content="Water your crops early in the morning to reduce evaporation loss.",
-                    category="general",
-                    language="en"
-                ),
-                FarmingTip(
-                    title="Organic Pest Control",
-                    content="Use neem oil spray (2ml per liter of water) to control common pests.",
-                    category="general",
-                    language="en"
-                ),
+                FarmingTip(title="Watering Best Practices",
+                           content="Water your crops early in the morning to reduce evaporation loss.",
+                           category="general", language="en"),
+                FarmingTip(title="Organic Pest Control",
+                           content="Use neem oil spray (2ml per liter of water) to control common pests.",
+                           category="general", language="en"),
             ]
             for tip in sample_tips:
                 db.session.add(tip)
-
             sample_prices = [
-                MarketPrice(
-                    crop_name="Rice",
-                    market_name="Mandi Bhav",
-                    region="Punjab",
-                    price=28.50,
-                    unit="kg",
-                    date=datetime.now().date(),
-                    source="Government Portal"
-                ),
+                MarketPrice(crop_name="Rice", market_name="Mandi Bhav", region="Punjab", price=28.50, unit="kg",
+                            date=datetime.now().date(), source="Government Portal"),
             ]
             for price in sample_prices:
                 db.session.add(price)
-
             db.session.commit()
-            print("✅ Default users and sample data created")
             return jsonify({"success": True, "message": "Database initialized successfully"})
         else:
             return jsonify({"success": True, "message": "Database already exists"})
-
     except Exception as e:
         db.session.rollback()
         print(f"❌ Database initialization error: {e}")
         return jsonify({"success": False, "error": str(e)}), 500
 
 
-@app.route("/admin/delete-chat/<int:chat_id>", methods=["POST"])
-@login_required
-@admin_required
-def admin_delete_chat(chat_id):
-    """Delete a specific chat"""
-    try:
-        chat = ChatHistory.query.get_or_404(chat_id)
-        db.session.delete(chat)
-        db.session.commit()
-        flash("Chat deleted successfully", "success")
-    except Exception as e:
-        db.session.rollback()
-        flash(f"Error deleting chat: {str(e)}", "danger")
-
-    return redirect(request.referrer or url_for('admin_chats'))
-
-
 @app.route("/backup-db")
 @login_required
 @admin_required
 def backup_database():
-    """Create a backup of the database"""
     try:
         if app.config['SQLALCHEMY_DATABASE_URI'].startswith('sqlite'):
-            # Extract the file path from SQLite URI
             db_path = app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', '')
             db_path = os.path.abspath(db_path)
-
             if os.path.exists(db_path):
                 backup_path = f"{db_path}.backup.{datetime.now().strftime('%Y%m%d_%H%M%S')}"
                 shutil.copy2(db_path, backup_path)
@@ -2320,84 +3129,100 @@ def backup_database():
                     "size_bytes": os.path.getsize(db_path),
                     "backup_file": backup_path
                 })
-
-        return jsonify({
-            "success": False,
-            "message": "Database backup not supported for this database type"
-        })
+        return jsonify({"success": False, "message": "Database backup not supported for this database type"})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/test-users")
 def test_users():
-    """Route to check if users exist"""
     users = User.query.all()
-    result = []
-    for user in users:
-        result.append({
-            'id': user.id,
-            'email': user.email,
-            'name': user.name,
-            'role': user.role,
-            'is_active': user.is_active,
-            'created_at': user.created_at.isoformat() if user.created_at else None
-        })
+    result = [{
+        'id': u.id,
+        'email': u.email,
+        'name': u.name,
+        'role': u.role,
+        'is_active': u.is_active,
+        'created_at': u.created_at.isoformat() if u.created_at else None
+    } for u in users]
     return jsonify({"users": result, "count": len(result)})
 
 
 @app.route("/check-db")
 def check_database():
-    """Debug endpoint to check database status"""
     try:
         with app.app_context():
-            # Get database info
             db_info = {
                 'database_uri': app.config['SQLALCHEMY_DATABASE_URI'],
-                'database_exists': os.path.exists(app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', ''))
-                if 'sqlite' in app.config['SQLALCHEMY_DATABASE_URI'] else 'N/A (PostgreSQL)',
+                'database_exists': os.path.exists(
+                    app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', '')) if 'sqlite' in app.config[
+                    'SQLALCHEMY_DATABASE_URI'] else 'N/A (PostgreSQL)',
                 'total_users': User.query.count(),
-                'users': []
+                'users': [{'id': u.id, 'email': u.email, 'name': u.name,
+                           'created_at': u.created_at.isoformat() if u.created_at else None} for u in User.query.all()]
             }
-
-            # Get all users
-            users = User.query.all()
-            for user in users:
-                db_info['users'].append({
-                    'id': user.id,
-                    'email': user.email,
-                    'name': user.name,
-                    'created_at': user.created_at.isoformat() if user.created_at else None
-                })
-
-            return jsonify({
-                'success': True,
-                'database_info': db_info
-            })
+            return jsonify({'success': True, 'database_info': db_info})
     except Exception as e:
-        return jsonify({
-            'success': False,
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        })
-
-    # ==================== DATABASE INITIALIZATION ====================
+        return jsonify({'success': False, 'error': str(e), 'traceback': traceback.format_exc()})
 
 
+@app.errorhandler(404)
+def not_found_error(error):
+    return "Page not found", 404
+
+
+@app.errorhandler(500)
+def internal_error(error):
+    db.session.rollback()
+    return "Internal server error", 500
+
+
+@app.route('/static/<path:filename>')
+def static_files(filename):
+    try:
+        return send_from_directory(app.static_folder, filename)
+    except:
+        return "File not found", 404
+
+    # -------------------------------------------------------------------
+
+
+# CREATE DEFAULT FORUM CATEGORIES (run once)
+# -------------------------------------------------------------------
+def create_default_forum_categories():
+    default_categories = [
+        {'name': 'Crop Cultivation', 'description': 'Discuss growing techniques, varieties, and best practices',
+         'icon': 'bi-tree-fill', 'color': 'success', 'thread_count': 0},
+        {'name': 'Pest Control', 'description': 'Share pest management solutions and experiences',
+         'icon': 'bi-bug-fill', 'color': 'warning', 'thread_count': 0},
+        {'name': 'Market & Sales', 'description': 'Discuss prices, marketing, and selling strategies',
+         'icon': 'bi-cash-coin', 'color': 'info', 'thread_count': 0},
+        {'name': 'Equipment', 'description': 'Discuss farm machinery, tools, and maintenance',
+         'icon': 'bi-tools', 'color': 'primary', 'thread_count': 0},
+        {'name': 'Weather', 'description': 'Share weather updates and farming adaptations',
+         'icon': 'bi-cloud-sun-fill', 'color': 'danger', 'thread_count': 0},
+        {'name': 'Q&A', 'description': 'Ask questions and get answers from experts',
+         'icon': 'bi-question-circle-fill', 'color': 'secondary', 'thread_count': 0},
+    ]
+    for cat_data in default_categories:
+        existing = ForumCategory.query.filter_by(name=cat_data['name']).first()
+        if not existing:
+            db.session.add(ForumCategory(**cat_data))
+    db.session.commit()
+    print("✅ Default forum categories inserted.")
+
+
+# -------------------------------------------------------------------
+# DATABASE INITIALIZATION
+# -------------------------------------------------------------------
 def init_database():
-    """Initialize database with proper error handling"""
     with app.app_context():
         try:
-            # Check if tables exist
             inspector = inspect(db.engine)
             existing_tables = inspector.get_table_names()
-
             print(f"📊 Existing tables: {existing_tables}")
-
-            # Create all tables
             db.create_all()
-
-            # Check if admin user exists
+            create_default_forum_categories()
             admin_exists = User.query.filter_by(email='admin@aiagrobot.com').first()
             if not admin_exists:
                 admin = User(
@@ -2414,8 +3239,6 @@ def init_database():
                 )
                 admin.set_password('admin123')
                 db.session.add(admin)
-
-                # Add demo farmer
                 demo = User(
                     email='demo@aiagrobot.com',
                     name='Demo Farmer',
@@ -2430,254 +3253,74 @@ def init_database():
                 )
                 demo.set_password('demo123')
                 db.session.add(demo)
-
                 db.session.commit()
                 print("✅ Created default admin and demo users")
-
             print(f"✅ Database initialized. Total users: {User.query.count()}")
-
         except Exception as e:
             print(f"❌ Database initialization error: {e}")
             traceback.print_exc()
 
-        # ==================== CREATE MISSING FILES ====================
+        # -------------------------------------------------------------------
 
 
+# CREATE MISSING FILES
+# -------------------------------------------------------------------
 def create_missing_files():
-    """Create missing template and static files"""
-
-    # Create templates directory
     templates_dir = os.path.join(basedir, "templates")
     os.makedirs(templates_dir, exist_ok=True)
-
-    # Create admin templates directory
     admin_templates_dir = os.path.join(templates_dir, "admin")
     os.makedirs(admin_templates_dir, exist_ok=True)
-
-    # Create static directories
     static_dirs = ['css', 'js', 'images', 'uploads', 'thumbnails']
     for dir_name in static_dirs:
         os.makedirs(os.path.join(basedir, "static", dir_name), exist_ok=True)
-
-        # Create a simple CSS file
     css_path = os.path.join(basedir, "static", "css", "style.css")
     if not os.path.exists(css_path):
         with open(css_path, 'w') as f:
             f.write("""/* Default CSS for AI-AgroBot */ 
-body { 
-    font-family: Arial, sans-serif; 
-    margin: 0; 
-    padding: 0; 
-    background-color: #f5f5f5; 
-} 
-
-.container { 
-    max-width: 1200px; 
-    margin: 0 auto; 
-    padding: 20px; 
-} 
-
-.header { 
-    background-color: #4CAF50; 
-    color: white; 
-    padding: 20px; 
-    text-align: center; 
-} 
-
-.navbar { 
-    background-color: #333; 
-    overflow: hidden; 
-} 
-
-.navbar a { 
-    float: left; 
-    color: white; 
-    text-align: center; 
-    padding: 14px 16px; 
-    text-decoration: none; 
-} 
-
-.navbar a:hover { 
-    background-color: #ddd; 
-    color: black; 
-} 
-
-.btn { 
-    background-color: #4CAF50; 
-    color: white; 
-    padding: 10px 20px; 
-    border: none; 
-    border-radius: 5px; 
-    cursor: pointer; 
-    text-decoration: none; 
-    display: inline-block; 
-} 
-
-.btn:hover { 
-    background-color: #45a049; 
-} 
-
-.form-group { 
-    margin-bottom: 15px; 
-} 
-
-.form-control { 
-    width: 100%; 
-    padding: 10px; 
-    border: 1px solid #ddd; 
-    border-radius: 5px; 
-    box-sizing: border-box; 
-} 
-
-.alert { 
-    padding: 10px; 
-    margin: 10px 0; 
-    border-radius: 5px; 
-} 
-
-.alert-success { 
-    background-color: #d4edda; 
-    color: #155724; 
-    border: 1px solid #c3e6cb; 
-} 
-
-.alert-danger { 
-    background-color: #f8d7da; 
-    color: #721c24; 
-    border: 1px solid #f5c6cb; 
-} 
-
-.alert-info { 
-    background-color: #d1ecf1; 
-    color: #0c5460; 
-    border: 1px solid #bee5eb; 
-} 
-
-.alert-warning { 
-    background-color: #fff3cd; 
-    color: #856404; 
-    border: 1px solid #ffeaa7; 
-} 
-
-.card { 
-    background: white; 
-    border-radius: 8px; 
-    padding: 20px; 
-    margin: 15px 0; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
-} 
-
-.table { 
-    width: 100%; 
-    border-collapse: collapse; 
-} 
-
-.table th, .table td { 
-    padding: 12px; 
-    text-align: left; 
-    border-bottom: 1px solid #ddd; 
-} 
-
-.table th { 
-    background-color: #f2f2f2; 
-    font-weight: bold; 
-} 
-
-.chat-container { 
-    background: white; 
-    border-radius: 8px; 
-    padding: 20px; 
-    margin: 20px 0; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
-} 
-
-.chat-message { 
-    margin: 10px 0; 
-    padding: 10px; 
-    border-radius: 5px; 
-} 
-
-.user-message { 
-    background-color: #e3f2fd; 
-    text-align: right; 
-} 
-
-.bot-message { 
-    background-color: #f5f5f5; 
-    text-align: left; 
-} 
-
-.dashboard-stats { 
-    display: flex; 
-    justify-content: space-between; 
-    flex-wrap: wrap; 
-    margin: 20px 0; 
-} 
-
-.stat-card { 
-    background: white; 
-    border-radius: 8px; 
-    padding: 20px; 
-    margin: 10px; 
-    flex: 1; 
-    min-width: 200px; 
-    text-align: center; 
-    box-shadow: 0 2px 4px rgba(0,0,0,0.1); 
-} 
-
-.stat-number { 
-    font-size: 2em; 
-    font-weight: bold; 
-    color: #4CAF50; 
-} 
-
-.stat-label { 
-    color: #666; 
-    margin-top: 5px; 
-} 
+body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f5f5f5; } 
+.container { max-width: 1200px; margin: 0 auto; padding: 20px; } 
+.header { background-color: #4CAF50; color: white; padding: 20px; text-align: center; } 
+.navbar { background-color: #333; overflow: hidden; } 
+.navbar a { float: left; color: white; text-align: center; padding: 14px 16px; text-decoration: none; } 
+.navbar a:hover { background-color: #ddd; color: black; } 
+.btn { background-color: #4CAF50; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; text-decoration: none; display: inline-block; } 
+.btn:hover { background-color: #45a049; } 
+.form-group { margin-bottom: 15px; } 
+.form-control { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 5px; box-sizing: border-box; } 
+.alert { padding: 10px; margin: 10px 0; border-radius: 5px; } 
+.alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; } 
+.alert-danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; } 
+.alert-info { background-color: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; } 
+.alert-warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeaa7; } 
+.card { background: white; border-radius: 8px; padding: 20px; margin: 15px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); } 
+.table { width: 100%; border-collapse: collapse; } 
+.table th, .table td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; } 
+.table th { background-color: #f2f2f2; font-weight: bold; } 
+.chat-container { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); } 
+.chat-message { margin: 10px 0; padding: 10px; border-radius: 5px; } 
+.user-message { background-color: #e3f2fd; text-align: right; } 
+.bot-message { background-color: #f5f5f5; text-align: left; } 
+.dashboard-stats { display: flex; justify-content: space-between; flex-wrap: wrap; margin: 20px 0; } 
+.stat-card { background: white; border-radius: 8px; padding: 20px; margin: 10px; flex: 1; min-width: 200px; text-align: center; box-shadow: 0 2px 4px rgba(0,0,0,0.1); } 
+.stat-number { font-size: 2em; font-weight: bold; color: #4CAF50; } 
+.stat-label { color: #666; margin-top: 5px; } 
 """)
-
-            # Create a placeholder image if it doesn't exist
     image_path = os.path.join(basedir, "static", "images", "farmer-ai.svg")
     if not os.path.exists(image_path):
-        # Create a simple SVG placeholder
         with open(image_path, 'w') as f:
-            f.write("""<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg"> 
-  <rect width="100%" height="100%" fill="#4CAF50" opacity="0.1"/> 
-  <circle cx="200" cy="150" r="80" fill="#4CAF50" opacity="0.3"/> 
-  <path d="M150,100 L250,100 L200,200 Z" fill="#4CAF50" opacity="0.5"/> 
-  <text x="200" y="280" text-anchor="middle" font-family="Arial" font-size="20" fill="#333">AI AgroBot</text> 
-</svg>""")
-
+            f.write(
+                '<svg width="400" height="300" xmlns="http://www.w3.org/2000/svg"><rect width="100%" height="100%" fill="#4CAF50" opacity="0.1"/><circle cx="200" cy="150" r="80" fill="#4CAF50" opacity="0.3"/><path d="M150,100 L250,100 L200,200 Z" fill="#4CAF50" opacity="0.5"/><text x="200" y="280" text-anchor="middle" font-family="Arial" font-size="20" fill="#333">AI AgroBot</text></svg>')
     print("✅ Created missing static files")
 
 
-# ==================== ERROR HANDLERS ====================
-
-@app.errorhandler(404)
-def not_found_error(error):
-    return "Page not found", 404
-
-
-@app.errorhandler(500)
-def internal_error(error):
-    db.session.rollback()
-    return "Internal server error", 500
-
-
-# ==================== MAIN ====================
-
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     print("🌾 AI-AgroBot Server Starting...")
     print("=" * 50)
-
-    # Create missing files
     create_missing_files()
-
-    # Initialize database
     init_database()
-
-    # Run the app
     print("\n✅ Server is running!")
     print("🌐 Open: http://localhost:5000")
     print("🔑 Default admin: admin@aiagrobot.com / admin123")
@@ -2687,10 +3330,5 @@ if __name__ == "__main__":
     print("🔍 Check database: http://localhost:5000/check-db")
     print("🔍 Test Gemini: http://localhost:5000/test-gemini")
     print("=" * 50)
-
-    app.run(
-        debug=True,
-        host="0.0.0.0",
-        port=5000
-    )
+    socketio.run(app, debug=True, host="0.0.0.0", port=5000, allow_unsafe_werkzeug=True)
 
